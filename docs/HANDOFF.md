@@ -301,4 +301,28 @@ ffmpeg 抽裸 HEVC → dovi_tool -m 5 convert -d（丢 EL + RPU 改写）→ ffm
 - `dvcC` payload `01000a35…` 与 Apple 官方 P5 L6 参考逐字节一致；RPU 自洽（nlq=none、残差禁用）
 - 分片 NAL 逐帧布局与 Apple 参考一致：`AUD(35), SEI(39), VCL, RPU(62)`；SEI 带 mdcv(137)/clli(144)
 - macOS VideoToolbox 成功解码本流（Apple 自家解码栈认可码流，bt2020/smpte2084 元数据正确）
-- SPS/VPS：profile_idc=2（Main10）✓；tier=High 是 4K@46.8Mbps 的合法且必需选择（Main tier 上限 40Mbps，Apple 1080p 示例用 Main tier 因其码率低）
+## 十一、Jellyfin 接入：/jf/pack 端点与模块直调（2026-09-26 凌晨，接第十节）
+
+### 1. 链路定型：Jellyfin 直连 URL → 现打 HLS → tvOS
+
+- 电视侧只出一个地址：dvplay 判定 DV 条目后返回 `http://<packHost>/jf/pack?src=<Jellyfin 直连 URL 含 api_key>&id=<itemId>&seconds=60`
+- `dvpack/jfpack.py` 新文件：`pack_source` = probe（http Range）→ `mvp_verdict` 闸门 → `remux.hls_command` → `p5.resign_pack` → master/媒体列表 → `verify`。单层 P8 转签 P5，P5 空过；**不碰 RPU 一个字节**
+- 实测：5GB MKV 的 ffprobe over HTTP **0.58s**（Jellyfin 认 Range），不需要先把片拉到 Mac
+- `serve.py` `/jf/pack`：src 只放行 **全部解析地址落在 RFC1918** 的 http(s)（服务听 0.0.0.0，防 SSRF）；id 走 `^[A-Za-z0-9_.-]{1,64}$`；seconds 夹 1..600；per-id 锁；缓存指纹 `src` **去掉 api_key**（token 不落盘）；打包后 302 到绝对路径 master（`/_jf/<id>/video.m3u8`，重定向后相对 URI 也不会解析错）
+- **测试抓出的真 bug**：`..` 能过 id 正则（点号在白名单里），`out_dir` 会变成 `<root>/_jf/..` 即静态根目录本身，产物写进 serve 根。修法：`set(item_id) <= {"."}` 的纯点号 id 一律 400。教训同 test_serve 的 traversal 用例——白名单字符 ≠ 安全
+- Swift 三处 `authHeader` 重复拼接修复（`"Authorization: " + header` 的 header 自带冒号，之前 TV 上 400 "无法链接服务器"）；DV 路由接 `packHost`（`dvplay.pack.host`，默认 `192.168.1.109:8899`）
+- Swift 编译错误记录：`item.isDV` 不存在（`isDV` 在 `MediaSource` 上，`Item` 的对应属性叫 `isDolbyVisionSource`），已改；`xcodebuild -destination generic/platform=tvOS` **BUILD SUCCEEDED**
+- `URLComponents.queryItems` 塞嵌套 URL 经 swiftc 实测：值里的 `&`/`=` 会被编码成 `%26`/`%3D`，Python `parse_qs` 解回来后 src 完整——`?&=` 不会被咬烂，注释里的结论成立
+
+### 2. 模块直调方式（"能不能直接调开源/付费项目的模块" = 能，本项目已在做）
+
+- 现成机制：`dvpack/tools.py require(path)` = 项目 `tools/bin/` 优先、PATH 回退；调用方 `remux._run(argv, cwd)` subprocess 外包。dvpack 自己只做编排（probe/闸门/校验），编解码与 box 正确性全部外包
+- 已直调：`dovi_tool` 2.3.4（RPU 转换/转签）、`ffmpeg`/`ffprobe`（Range 直读 http）、**Bento4 全套 23 个工具**（brew 无 bottle，改从官网 `Bento4-SDK-1-6-0-641.universal-apple-macosx.zip` 拉，解压 `bin/` 已复制进 `tools/bin/`，`mp4dump`/`mp4info`/`mp4dash`/`mp4hls` 等随取随用）
+- 付费/闭源模块同理：用户提供二进制 → 丢进 `tools/bin/` → `require()` 直接调，**零代码改动**。欠账：Apple `mediafilesegmenter`（parity 参照物）brew/GitHub 均无，官网下载需 Apple ID——等用户登录后补
+- 另一条路（未用）：uv 装 Python 库直接 import；ctypes 直调 dylib。CLI 外包的收益是故障域清晰（一条命令一个进程，日志即证据）
+
+### 3. 本轮测试与提交
+
+- `tests/test_jfpack.py` 24 条新测试：src 校验（公网/DNS 混合/非 http）、id 白名单+纯点号、seconds 夹取、指纹去 api_key、302 与缓存命中；真片源 E2E 用 `DVPACK_SOURCE_MKV` 门控跳过
+- 全量 `uv run --with pytest python -m pytest -q`：**123 passed / 10 skipped / 1 failed**（`test_remux.py::test_end_to_end_produces_dvh1_with_config_box` 为既有环境失败，无真片源环境变量，与改动无关）
+- 未做：真机验收（电视 `00008110-0002149A0A9B801E` 仍休眠，截图 error 25005）；Bento4 比对出的结构差异（c608 轨/pasp/chrm/fiel/swre 缺失）与徽标的因果未证
