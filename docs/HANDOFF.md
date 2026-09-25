@@ -43,7 +43,7 @@ uv run --with pytest python -m pytest -q               # 66 passed, 5 skipped
 ```
 
 - `tools/` 不随仓库分发（Windows 侧放便携 ffmpeg）。Mac 用 Homebrew 软链即可，代码零改动。
-- `dovi_tool` 无需提供：`tools.py` 里只定义了路径，全仓库无引用。
+- ~~`dovi_tool` 无需提供~~（已作废）：`scripts/p7_to_p5.py` 经 `tools.DOVI_TOOL` 引用，获取方式见第九节第 1 条与 `scripts/fetch_dovi_tool.sh`。
 - 测试 66 通过 + 5 跳过 = 71，与 Release Notes 声称的 "71 passed" 一致；
   跳过的 5 个是绑定 `D:/movie/...` 片源的集成测试，只在 Windows 主机跑。
 
@@ -183,7 +183,7 @@ xcodebuild -project dvplay.xcodeproj -scheme dvplay -sdk appletvsimulator27.0 bu
 **遗留待办**
 - **P5 信令变体徽标是否点亮：待用户目视确认**（正在电视上播）。
 - 若点亮 → dvpack 下一步：P8 源重签 P5 或接受真 P5 片源做端到端验收；片库 6656 部翻完无 P5 源（全 P8 WEB-DL / FraMeSToR P7 双层），用户需自备一部 P5（≤L7）片源。
-- 若不亮 → RPU 内嵌 profile 也要重写（需自研 dovi_tool -m2 等价逻辑；pypi/github 被 TUN 拦截，装不了现成工具）。
+- 若不亮 → 剩余变量见第九节第 4 条（compat_id=1 / chrm/mdcv/clli / RPU 逐帧重写）。RPU 重写本身已解决：dovi_tool 2.3.4 经 Homebrew bottle 镜像取得，见第九节。
 
 **追加实验（P5/P7，均失败，已归档）**
 - `_out/dv_p5`：同一 BL+RPU 码流，dvcC/CODECS 改签 Profile 5（`dvh1.05.06`）→ 不亮，颜色仍不对。结论：只改容器信令不够——RPU 本身还是 P8.1 语义，重新打签造出的是不自洽的 P5。
@@ -191,7 +191,7 @@ xcodebuild -project dvplay.xcodeproj -scheme dvplay -sdk appletvsimulator27.0 bu
 - `_out/dv_p7`：真双层源（Halo S02E01 FraMeSToR REMUX，BL+EL+FEL，dvcC profile=7）→ **tvOS 直接播放失败**，与规范只认 P5 吻合。
 - `_out/dv`（当前 serve 指向）：诚实态——P8 + HDR10 回退。
 
-**结论**：tvOS 的 HLS 杜比视界通路 = Apple 规范 P5；P8 打包必然 HDR10 回退（颜色偏=BL 未经 RPU 处理）；P7 双层直接拒播；P8 重签 P5 不自洽。要闭环必须拿到**真 P5 单层片源**或实现 RPU 重写（需 dovi_tool 级工具，pypi/github 均被 TUN 拦截装不了）。
+**结论**（前半仍成立，后半已被第九节推翻）：tvOS 的 HLS 杜比视界通路 = Apple 规范 P5；P8 打包必然 HDR10 回退；P7 双层直接拒播；P8 重签 P5 不自洽。闭环**已实现**：dovi_tool 经 bottle 镜像取得，RPU 重写用 `dovi_tool -m 5 convert -d`，见第九节与 `scripts/p7_to_p5.py`。
 
 ## 八、Apple 官方参考流逐字节对照：`dvcC` 是规范名，`dvvC` 不是（2026-09-25 深夜）
 
@@ -235,3 +235,46 @@ https://devstreaming-cdn.apple.com/videos/streaming/examples/adv_dv_atmos/main.m
 - `_out/dv`（serve 8899 指向的目录）已用新链路重打包：P8 L6 → **P5 L6 + dvcC + dvh1.05.06**，无回退层属性
 - **待真机确认**：Apple TV 上 kill 掉 dvplay 再打开（冷启动会自动起播），看电视是否点亮 DV 徽标
 - 若不亮，下一次实验变量只剩：`compat_id=1`（沿源值）、补 `chrm`/`mdcv`/`clli` box、以及 RPU 本身的重写
+
+## 九、P7→P5 全 dovi_tool 链路（2026-09-25 夜，接第八节）
+
+**第八节结论只剩"RPU 本身要重写、需要 dovi_tool 级工具、装不了"。本节：工具拿到了，RPU 重写也落地了。**
+
+### 1. dovi_tool 的获取方式（回答"能不能直接调用开源模块"：能，但不在上游站点）
+
+- GitHub / pypi.org / crates.io 直连 TLS 全被本机 TUN 拦；cargo rsproxy 镜像里也没有这个 crate
+- **Homebrew bottle 镜像可达**：`mirrors.tuna.tsinghua.edu.cn`、`mirrors.ustc.edu.cn`、`mirrors.aliyun.com`（均有 homebrew-bottles）
+- 已固化为 `scripts/fetch_dovi_tool.sh`：多镜像 × 多 tag（tahoe/sequoia/sonoma）回退，落盘 `tools/bin/dovi_tool`，`--version` 验证后才算成功；实测走 TUNA 一把过。`tools/` 在 .gitignore 里，二进制不入库
+- 本机（macOS 27.0）用 **tahoe** 的 bottle 正常运行
+
+### 2. dovi_tool convert 模式实验表（P7 源 = Halo S02E01，12s）
+
+| 链路 | nlq_method_idc | disable_residual_flag | 判读 |
+|---|---|---|---|
+| 原始 P7 | linear_dz | 0 | 双层原样，tvOS 拒播 |
+| mode 1 | linear_dz | 0 | 伪 P5：丢了 EL，RPU 仍不自洽 |
+| mode 2 | none | 1 | 自洽单层 |
+| **mode 5** | **none** | **1** | **自洽单层，保留 luma/chroma 映射，选用** |
+
+- `-m` 是**全局参数**，必须写在子命令前：`dovi_tool -m 5 convert -i x -o y -d`
+- 自洽性判据已代码化：`remux.check_rpu_consistency()` 读前几帧 side data，`nlq=none` 且 `disable_residual=1` 才算过；接入 `verify()`，mode 1 产物在 `tests/test_remux.py` 里作反面控制（真机教训的可回归代理）
+
+### 3. 新链路 `scripts/p7_to_p5.py`（P7 源 → 可点亮 P5）
+
+```
+ffmpeg 抽裸 HEVC → dovi_tool -m 5 convert -d（丢 EL + RPU 改写）→ ffmpeg 打 CMAF
+→ resign_init_segment 按 Apple 模板新建 dvcC（裸 HEVC 无 DOVI 侧数据，ffmpeg 一个 box 都不写）
+```
+
+- 产物 `_out/dv_p7`：`dvcC` payload `01000a35…` 与 Apple 官方 L6 **逐字节相同**；RPU 自洽；`dvh1.05.06` + `VIDEO-RANGE=PQ`，无 SUPPLEMENTAL/HDCP
+- `bmff.insert_box_after()`：moov 收尾布局下插 box 并修正父链尺寸（含 moov 自身），尺寸不符即报错不静默
+- 回归：P8 + P7 双片源 `pytest -q` → **103 passed, 1 skipped**
+- 踩坑记录：`p5.py` 曾混进一行占位 `return None`，把转签主路径整个废掉（测试 4 连挂红才发现）——提交前必跑全套，别信"刚才还是绿的"
+
+### 4. 当前状态（交接点）
+
+- serve（8899，plist root 已切）现指向 **`_out/dv_p7`**（P7→P5 产物，Halo 24s，单分片 157MB）
+- **待真机确认**：Apple TV 冷启动 dvplay，看电视 DV 徽标是否点亮、颜色是否正常——这是唯一本地判不了的验收项
+- 若点亮：`mvp_verdict` 放开 P7（当前以"未覆盖双层"拒绝打包），`p7_to_p5.py` 提升为一等 `dvpack` 命令，`check` 的 P8 警告措辞同步调整
+- 若仍不亮，剩余变量依次：`compat_id=1`（沿源值）、补 `chrm`/`mdcv`/`clli` box、RPU 逐帧重写（`dovi_tool editor`）
+- 旧结论作废声明：第七/八节中"pypi/github 装不上工具""必须真 P5 片源或自研 RPU 重写"已被本节推翻；`docs/HANDOFF.md` 内相关三行已同步修订
