@@ -278,3 +278,27 @@ ffmpeg 抽裸 HEVC → dovi_tool -m 5 convert -d（丢 EL + RPU 改写）→ ffm
 - 若点亮：`mvp_verdict` 放开 P7（当前以"未覆盖双层"拒绝打包），`p7_to_p5.py` 提升为一等 `dvpack` 命令，`check` 的 P8 警告措辞同步调整
 - 若仍不亮，剩余变量依次：`compat_id=1`（沿源值）、补 `chrm`/`mdcv`/`clli` box、RPU 逐帧重写（`dovi_tool editor`）
 - 旧结论作废声明：第七/八节中"pypi/github 装不上工具""必须真 P5 片源或自研 RPU 重写"已被本节推翻；`docs/HANDOFF.md` 内相关三行已同步修订
+
+## 十、真机断链的两个根因（2026-09-25 深夜，接第九节）
+
+### 1. 播放器根本拉不到分片：`EXTINF:0.000000`（已修，提交 `6810fa2`）
+
+- 现象：serve 日志里电视**只轮询 `master.m3u8`/`video.m3u8`**（20:40 起每次 50s 一次），**从不请求 `init.mp4` 和分片**；21:12 首次拉起 dvplay 后同样只读列表
+- 根因：`dovi_tool convert` 输出的裸 HEVC **没有任何 pts**（raw demuxer 不产时间戳，实测 `packet pts=N/A`），ffmpeg hls muxer 据此写出 `#EXTINF:0.000000`、`#EXT-X-TARGETDURATION:0`——违反 RFC 8216（TARGETDURATION 须为正整数），AVPlayer 直接按非法列表拒绝加载，连 init 段都不碰
+- 修复：`pack()` 加 `-bsf:v setts=time_base=<源r_frame_rate>:ts=N:duration=1`，零重编码补 CFR 时间戳。修复后 21:18:53 电视**首次**拉到 `init.mp4`+`video0.m4s` 并起播
+- 连带修：master 的 `FRAME-RATE` 不能从产物列表反推（setts 后容器时间元数据是垃圾，曾算出 16016），改从源探 `r_frame_rate`
+- `HDCP-LEVEL=TYPE-1` 实验：加上后**黑屏**（电视侧没协商上 Type-1 时 TYPE-1 内容直接被拦），默认关闭，仅 `--hdcp` 可选
+
+### 2. dvplay 在电视上装的是旧 build：内联播放切不了显示模式（已修，装 5196bf1 全屏版）
+
+- 现象：截图里视频是**内联小窗**（随 ScrollView 滚动、位置变化），不是全屏
+- 根因：电视上装的是 18:50 的旧 build（全屏改造 `5196bf1` 20:02 构建之后**从未安装**）。`5196bf1` 之前用 SwiftUI `VideoPlayer` 内联渲染，而 tvOS 上内联渲染**切不了显示模式**——DV 徽标点亮的必要条件（源码注释自己写明）根本不成立。之前所有"没点亮"结论都是在这个结构下测的
+- 修复：重新 `xcodebuild Release(device)` + `devicectl device install`，21:41 安装。新 build 起播即进 `AVPlayerViewController` 全屏（截图证实），系统切显示模式的路径打通
+- 当前状态：电视正全屏播放 P7→P5 包（Halo 24s），**DV 徽标是否点亮待用户目视物理屏幕**——截图看不到电视硬件指示灯
+
+### 附：本地已穷尽的判据（都证明包本身没问题）
+
+- `dvcC` payload `01000a35…` 与 Apple 官方 P5 L6 参考逐字节一致；RPU 自洽（nlq=none、残差禁用）
+- 分片 NAL 逐帧布局与 Apple 参考一致：`AUD(35), SEI(39), VCL, RPU(62)`；SEI 带 mdcv(137)/clli(144)
+- macOS VideoToolbox 成功解码本流（Apple 自家解码栈认可码流，bt2020/smpte2084 元数据正确）
+- SPS/VPS：profile_idc=2（Main10）✓；tier=High 是 4K@46.8Mbps 的合法且必需选择（Main tier 上限 40Mbps，Apple 1080p 示例用 Main tier 因其码率低）
