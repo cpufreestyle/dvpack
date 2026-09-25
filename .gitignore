@@ -1,0 +1,6 @@
+tools/
+_out/
+__pycache__/
+*.pyc
+.pytest_cache/
+_scratch/
