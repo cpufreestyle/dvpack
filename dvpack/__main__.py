@@ -40,9 +40,13 @@ def _check(path: Path) -> int:
 def _pack(path: Path, out: Path, seconds: float | None) -> int:
     out.mkdir(parents=True, exist_ok=True)
     source, output = remux(path, out, seconds=seconds)
-    result = verify(source, output)
+    target = source.dovi.profile5_target if source.dovi else None
+    result = verify(source, output, target=target)
     print(f"打包: {path.name} → {out}")
     print(f"  信令   : {result.signalling}")
+    print(f"  源     : {source.dovi}")
+    if target is not None and target != source.dovi:
+        print(f"  转签   : → {target}（Apple 官方 P5 写法）")
     print(f"  复读   : {result.output_dovi}")
     print(f"  分片   : {len(output.segments)} 段")
     for problem in result.problems:
@@ -54,7 +58,10 @@ def _pack(path: Path, out: Path, seconds: float | None) -> int:
     # 打包了前 N 秒就用 N 算带宽，否则用整片时长。低报会让客户端选错码率、起播就卡。
     duration = seconds or source.duration
     variant = variant_from_source(
-        source, output.playlist.name, bandwidth=bandwidth_from_segments(output.segments, duration)
+        source,
+        output.playlist.name,
+        bandwidth=bandwidth_from_segments(output.segments, duration),
+        target=target,
     )
     write_master_playlist(out / "master.m3u8", [variant])
     print(f"  列表   : {out / 'master.m3u8'}")

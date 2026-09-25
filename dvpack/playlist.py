@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
 
-from .probe import SourceInfo
+from .probe import DoviRecord, SourceInfo
 
 # Apple 附录：db1p = 与 HDR10 兼容（对应 8.1），db4h = 与 HLG 兼容（对应 8.4）。
 # Profile 5 按定义没有任何回退层，所以它不该带 SUPPLEMENTAL-CODECS。
@@ -52,8 +52,13 @@ class Variant:
         return "#EXT-X-STREAM-INF:" + ",".join(parts)
 
 
-def supplemental_codecs(source: SourceInfo) -> str | None:
-    dovi = source.dovi
+def supplemental_codecs(source: SourceInfo, target: DoviRecord | None = None) -> str | None:
+    """随目标信令变：转签成 P5 之后没有回退层，只能空。
+
+    Apple 官方参考流 adv_dv_atmos 的 P5 变体一个 SUPPLEMENTAL 都不写，
+    而 P8 变体（维基式 HDR10 回退）才写 db1p / db4h。
+    """
+    dovi = target if target is not None else source.dovi
     if dovi is None or dovi.profile != 8:
         return None
     brand = _SUPPLEMENTAL_BY_RANGE.get(source.video.apple_video_range)
@@ -65,13 +70,21 @@ def variant_from_source(
     uri: str,
     *,
     bandwidth: int,
-    hdcp_level: str = "TYPE-1",
+    hdcp_level: str | None = "TYPE-1",
+    target: DoviRecord | None = None,
 ) -> Variant:
-    """DV 信令全部来自探测结果，不在这里二次推断。"""
-    dovi = source.dovi
+    """DV 信令全部来自探测结果，不在这里二次推断。
+
+    target 是转签后的信令（默认等于源）。默认值不变，所以 P8 直打包的通路
+    行为和以前一致；P5 通路的 codecs / supplemental 都按 target 走。
+    """
+    dovi = target if target is not None else source.dovi
     if dovi is None:
         raise ValueError(f"{source.path} 没有 DOVI 记录，不该走 DV 打包")
     video = source.video
+    if target is not None and dovi.profile == 5:
+        # Apple 官方 P5 变体（adv_dv_atmos）不写 HDCP-LEVEL，照着参考来
+        hdcp_level = None
     return Variant(
         uri=uri,
         bandwidth=bandwidth,
@@ -80,7 +93,7 @@ def variant_from_source(
         resolution=(video.width, video.height) if video.width and video.height else None,
         frame_rate=video.frame_rate or None,
         hdcp_level=hdcp_level,
-        supplemental_codecs=supplemental_codecs(source),
+        supplemental_codecs=supplemental_codecs(source, target=target),
     )
 
 

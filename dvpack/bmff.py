@@ -66,6 +66,7 @@ class TrackReport:
     sample_entry_type: str | None
     sample_entry_children: tuple[str, ...]
     dvcc: bytes | None
+    dv_box: str | None = None
 
     @property
     def is_video(self) -> bool:
@@ -78,17 +79,31 @@ class TrackReport:
 
     @property
     def has_dvvC(self) -> bool:
+        """DV 配置 box 在不在。`dvvC` 与 `dvcC` 任一俗名都算在。"""
         return self.dvcc is not None
 
     @property
+    def has_dvcC(self) -> bool:
+        """只认规范名 `dvcC`。
+
+        ffmpeg 写的是俗名 `dvvC`，ffprobe 两种都读——所以本地复读永远看不出差别，
+        而 Apple 官方参考流（adv_dv_atmos）用的是 `dvcC`。转签见 dvpack.p5。
+        """
+        return self.dv_box == "dvcC"
+
+    @property
     def signalling(self) -> str:
-        """DV 信令成立 = sample entry 是 dvh1 且带 dvvC。两个条件缺一不可。"""
+        """DV 信令成立 = sample entry 是 dvh1 且带配置 box。两个条件缺一不可。
+
+        报的是**实际写下的那个名字**：`dvvC`（ffmpeg 俗名）与 `dvcC`（Apple 规范名）
+        对 ffprobe 等价，对 tvOS 不等价，所以这里必须区分。
+        """
         if self.sample_entry_type == "dvh1" and self.has_dvvC:
-            return "dvh1+dvvC"
+            return f"dvh1+{self.dv_box}"
         if self.sample_entry_type == "dvh1":
-            return "dvh1 但缺 dvvC"
+            return "dvh1 但缺 dvC"
         if self.has_dvvC:
-            return f"有 dvvC 但 sample entry 是 {self.sample_entry_type}"
+            return f"有 {self.dv_box} 但 sample entry 是 {self.sample_entry_type}"
         return f"{self.sample_entry_type}，无 DV 信令"
 
 
@@ -214,14 +229,93 @@ def parse_file(path: str | Path, *, max_moov_bytes: int = 32 * 1024 * 1024) -> B
     return BmffReport(path, tracks, names, tuple(problems))
 
 
+# DOVI configuration record 的两种 box 名。`dvcC` 是 Apple/HLS 规范名，
+# `dvvC` 是 ffmpeg 实际写下的俗名（ffprobe 两者都读，tvOS 只认前者）。
+DV_BOX_NAMES = ("dvcC", "dvvC")
+
+
+@dataclass(frozen=True)
+class DvBox:
+    """配置 box 在文件里的落点。payload_len 与 box 尺寸分离，写回时才好核对。"""
+
+    fourcc: str
+    file_offset: int
+    payload_offset: int
+    payload: bytes
+
+
+def locate_dv_boxes(data: bytes) -> tuple[DvBox, ...]:
+    """在 init 段的 moov 树里定位 DV 配置 box，返回可写回的落点。
+
+    只在 moov 内搜索：init 段的 DV 配置只可能出现在 stsd 的 sample entry 里，
+    而 stsd 必然在 moov 树下。分片里出现同名字节属于巧合，不能拿来改。
+    偏移是**文件内绝对偏移**，调用方直接改 bytes 即可，无需再换算。
+    """
+    tops = _scan_buffer(data)
+    moov = next(((off, size) for name, off, size in tops if name == "moov"), None)
+    if moov is None:
+        return ()
+    moov_offset, moov_size = moov
+    buf = data[moov_offset : moov_offset + moov_size]
+    parsed = _parse_box(buf, 0, len(buf), 1)
+    if parsed is None:
+        return ()
+    found: list[DvBox] = []
+    for name in DV_BOX_NAMES:
+        for box in parsed.find_all(name):
+            payload_start = 8
+            found.append(
+                DvBox(
+                    fourcc=name,
+                    file_offset=moov_offset + box.offset,
+                    payload_offset=moov_offset + box.offset + payload_start,
+                    payload=buf[box.offset + payload_start : box.offset + box.size],
+                )
+            )
+    return tuple(found)
+
+
+def _scan_buffer(data: bytes) -> tuple[tuple[str, int, int], ...]:
+    """顶层 box 扫描的 buffer 版；与 _scan_top_level 同一套规则，少读一次盘。"""
+    found: list[tuple[str, int, int]] = []
+    cursor = 0
+    total = len(data)
+    while cursor + 8 <= total:
+        size = int.from_bytes(data[cursor : cursor + 4], "big")
+        btype = data[cursor + 4 : cursor + 8].decode("latin-1")
+        if size == 1:
+            size = int.from_bytes(data[cursor + 8 : cursor + 16], "big")
+        elif size == 0:
+            size = total - cursor
+        if size < 8 or cursor + size > total:
+            break
+        found.append((btype, cursor, size))
+        cursor += size
+    return tuple(found)
+
+
 def _report_track(trak: Box, data: bytes) -> TrackReport:
+    box, payload = _find_dv_payload(trak, data)
     return TrackReport(
         track_id=_track_id(trak, data),
         handler=_handler(trak, data),
         sample_entry_type=_sample_entry(trak, data)[0],
         sample_entry_children=_sample_entry(trak, data)[1],
-        dvcc=_payload(trak, data, "dvvC") or _payload(trak, data, "dvcC"),
+        dvcc=payload,
+        dv_box=box.type if box else None,
     )
+
+
+def _find_dv_payload(trak: Box, data: bytes) -> tuple[Box | None, bytes | None]:
+    """按 Apple 规范名优先的顺序找配置 box，返回 (box, payload)。
+
+    返回 box 而不只返回 payload，是因为转签要按 box 的真实 offset 写回原文件。
+    """
+    for name in ("dvcC", "dvvC"):
+        found = next(iter(trak.find_all(name)), None)
+        if found is not None:
+            return found, data[found.offset + 8 : found.offset + found.size]
+    return None, None
 
 
 def _track_id(trak: Box, data: bytes) -> int | None:

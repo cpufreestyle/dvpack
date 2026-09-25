@@ -106,7 +106,7 @@ def test_tag_v_dvh1_renames_entry_but_writes_no_dvvC(tmp_path: Path):
     assert video.declares_dolby_vision
     assert "hvcC" in video.sample_entry_children
     assert video.dvcc is None
-    assert video.signalling == "dvh1 但缺 dvvC"
+    assert video.signalling == "dvh1 但缺 dvC"
 
 
 def test_dvh1_with_dvvC_is_recognised(tmp_path: Path):
@@ -125,7 +125,7 @@ def test_dvh1_without_dvvC_is_reported_as_missing_box(tmp_path: Path):
     (tmp_path / "init.mp4").write_bytes(data)
     video = parse_file(tmp_path / "init.mp4").video
     assert video.dvcc is None
-    assert video.signalling == "dvh1 但缺 dvvC"
+    assert video.signalling == "dvh1 但缺 dvC"
 
 
 def test_hvc1_is_not_dolby_vision_signalling(tmp_path: Path):
@@ -175,3 +175,39 @@ def test_census_ignores_type62_that_is_not_a_dovi_rpu(tmp_path: Path):
     not_rpu = bytes([0x7C, 0x01, 0x00, 0x01])
     (tmp_path / "es.265").write_bytes(_annexb(not_rpu))
     assert census_annexb(tmp_path / "es.265").dovi_rpu == 0
+
+
+def test_dvcC_is_the_name_apple_uses(tmp_path: Path):
+    """同样两字节 payload，box 名不同，signalling 必须分别报出来。
+
+    这是整项目的转折点：ffprobe 读 dvvC 与 dvcC 都返回同一组字段，所以本地复读
+    看不出差别；Apple 官方 adv_dv_atmos 写 dvcC。判据必须认名，不能只认有没有。
+    """
+    for name in ("dvcC", "dvvC"):
+        (tmp_path / "a.mp4").write_bytes(
+            _file("dvh1", _box("hvcC", b"\x01\x02") + _box(name, DVVC_PAYLOAD))
+        )
+        video = parse_file(tmp_path / "a.mp4").video
+        assert video.dv_box == name
+        assert video.signalling == f"dvh1+{name}"
+        assert video.has_dvcC is (name == "dvcC")
+
+
+def test_apple_reference_record_roundtrips(tmp_path: Path):
+    """Apple 官方 P5 init 的 dvcC 落点：解析后逐字节对上再写回，不能有漂移。"""
+    from dvpack.bmff import locate_dv_boxes
+    from dvpack.p5 import DvcConfig
+
+    # 取自 devstreaming-cdn.apple.com 的 adv_dv_atmos，P5/L6 变体 fileSequence0.mp4
+    reference = "01000a350000000000000000000000000000000000000000"
+    data = _file(
+        "dvh1", _box("hvcC", b"\x01\x02") + _box("dvcC", bytes.fromhex(reference))
+    )
+    (tmp_path / "init.mp4").write_bytes(data)
+    boxes = locate_dv_boxes((tmp_path / "init.mp4").read_bytes())
+    assert len(boxes) == 1
+    assert boxes[0].fourcc == "dvcC"
+    config = DvcConfig.parse(boxes[0].payload)
+    assert (config.profile, config.level, config.rpu_present, config.el_present,
+            config.bl_present, config.compat_id) == (5, 6, True, False, True, 0)
+    assert config.encode().hex().startswith("01000a35")

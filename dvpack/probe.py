@@ -72,6 +72,27 @@ class DoviRecord:
     def is_single_layer(self) -> bool:
         return self.el_present is False
 
+    @property
+    def profile5_target(self) -> DoviRecord:
+        """Apple HLS 规范 §1.9 只认 Profile 5，这是单层源转签后的目标信令。
+
+        字节模板取自 Apple 官方参考流 `adv_dv_atmos` 的 P5 变体
+        （devstreaming-cdn.apple.com/videos/streaming/examples/adv_dv_atmos），
+        实测 `dvcC` payload = `01 00 0a 35 00 00...`：profile 5、level 6、
+        rpu/bl 置位、el 清零、`dv_bl_signal_compatibility_id = 0`。
+        level 原样保留——把高 level 悄悄压成 7 是谎报，判不过来。
+        """
+        return DoviRecord(
+            profile=5,
+            level=self.level,
+            rpu_present=self.rpu_present,
+            el_present=False,
+            bl_present=True,
+            compat_id=0,
+            md_compression=self.md_compression,
+            spec_version=self.spec_version,
+        )
+
 
 @dataclass(frozen=True)
 class VideoStream:

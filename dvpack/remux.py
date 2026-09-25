@@ -20,6 +20,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .bmff import parse_file
+from .p5 import resign_pack
 from .probe import DoviRecord, SourceInfo, mvp_verdict, probe
 from .tools import FFMPEG, require
 
@@ -56,10 +57,16 @@ class Verification:
     output_dovi: DoviRecord | None
     problems: tuple[str, ...] = ()
     notes: tuple[str, ...] = ()
+    target_dovi: DoviRecord | None = None
 
     @property
     def dovi_preserved(self) -> bool:
         return self.source_dovi is not None and self.source_dovi == self.output_dovi
+
+    @property
+    def dovi_relabelled(self) -> bool:
+        """转签是否真的落地：产出信令 == 目标信令（P5），而不是"和源一样"。"""
+        return self.target_dovi is not None and self.target_dovi == self.output_dovi
 
 
 def hls_command(
@@ -147,11 +154,20 @@ def remux(
     output = resolve_output(out_dir / playlist)
     if not output.exists:
         raise RemuxError(f"产出不完整：init 或分片缺失（{proc.stderr.strip()}）")
+
+    # Apple HLS §1.9 只认 Profile 5：源是 P8 单层时把 init 段转签成 P5。
+    # 只动配置 box 签名与 profile/level/compat，分片里的 RPU 一个字节都不碰。
+    resign_pack(output.init, source.dovi)
     return source, output
 
 
-def verify(source: SourceInfo, output: RemuxOutput) -> Verification:
-    """独立判据：读 init 段的 box 结构，再用 ffprobe 复读配置记录比对源。"""
+def verify(source: SourceInfo, output: RemuxOutput, *, target: DoviRecord | None = None) -> Verification:
+    """独立判据：读 init 段的 box 结构，再用 ffprobe 复读配置记录比对**目标**。
+
+    target 默认等于源信令，所以没转签的通路行为和以前一致；转签后传进来的
+    是 profile5_target，比对的就是"产出是否真成了 P5 + dvcC"。
+    """
+    expected = target if target is not None else source.dovi
     problems: list[str] = []
     report = parse_file(output.init)
     video = report.video
@@ -163,14 +179,18 @@ def verify(source: SourceInfo, output: RemuxOutput) -> Verification:
             problems.append(f"sample entry 是 {video.sample_entry_type}，不是 dvh1")
         if not video.has_dvvC:
             problems.append("缺 DV 配置 box：电视只会当普通 HDR 放")
+        elif not video.has_dvcC:
+            problems.append(
+                f"配置 box 是俗名 {video.dv_box}：ffprobe 读得出，tvOS 只认规范名 dvcC"
+            )
 
     try:
         out_dovi = probe(output.init).dovi
     except Exception as exc:  # noqa: BLE001
         out_dovi = None
         problems.append(f"ffprobe 读 init 段失败：{type(exc).__name__}")
-    if out_dovi != source.dovi:
-        problems.append(f"DoviRecord 不一致：源 {source.dovi} ≠ 产出 {out_dovi}")
+    if out_dovi != expected:
+        problems.append(f"DoviRecord 不符：目标 {expected} ≠ 产出 {out_dovi}")
 
     return Verification(
         ok=not problems,
@@ -178,9 +198,10 @@ def verify(source: SourceInfo, output: RemuxOutput) -> Verification:
         source_dovi=source.dovi,
         output_dovi=out_dovi,
         problems=tuple(problems),
+        target_dovi=expected,
     )
 
 
 def remux_and_verify(src: str | Path, out_dir: str | Path, **kwargs) -> Verification:
     source, output = remux(src, out_dir, **kwargs)
-    return verify(source, output)
+    return verify(source, output, target=source.dovi.profile5_target if source.dovi else None)

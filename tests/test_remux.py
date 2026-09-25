@@ -11,7 +11,8 @@ import subprocess
 from pathlib import Path
 
 import pytest
-from dvpack.bmff import parse_file
+from dvpack.bmff import locate_dv_boxes, parse_file
+from dvpack.p5 import DvcConfig
 from dvpack.probe import parse_probe_json
 from dvpack.remux import RemuxError, hls_command, remux, remux_and_verify, resolve_output
 from dvpack.tools import FFMPEG
@@ -73,12 +74,30 @@ def test_remux_refuses_non_dovi_source(monkeypatch, tmp_path: Path):
 
 
 @needs_source
+@needs_source
+def test_end_to_end_resign_lands_on_apple_template(tmp_path: Path):
+    """转签落地的端到端判据：init 段的 dvcC 必须逐字节等于 Apple 官方 P5 模板。
+
+    只比 ffprobe 字段不够——ffprobe 读 dvvC 与 dvcC 都返回同一组值，看不出差别；
+    比字节模板 + 比 box 名，才是 tvOS 真正看到的形态。
+    """
+    _, output = remux(SRC, tmp_path, seconds=6, segment_seconds=2)
+    data = output.init.read_bytes()
+    record = DvcConfig.parse(next(iter(locate_dv_boxes(data))).payload)
+    assert (record.profile, record.level, record.rpu_present, record.el_present,
+            record.bl_present, record.compat_id) == (5, record.level, True, False, True, 0)
+    assert record.encode()[:5].hex().startswith("01000a35"), record.encode().hex()
+    assert b"dvcC" in data and b"dvvC" not in data
+
+
 def test_end_to_end_produces_dvh1_with_config_box(tmp_path: Path):
     verification = remux_and_verify(SRC, tmp_path, seconds=6, segment_seconds=2)
     assert verification.ok, verification.problems
-    assert verification.signalling == "dvh1+dvvC"
-    assert verification.dovi_preserved
+    assert verification.signalling == "dvh1+dvcC"
+    # 源是 P8：信令必须按 Apple 规范转签成 P5，而不是"和源逐字段相同"
+    assert verification.dovi_relabelled
     assert verification.output_dovi.profile == 5
+    assert verification.target_dovi.profile == 5
 
 
 @needs_source
@@ -95,4 +114,4 @@ def test_missing_strict_unofficial_loses_the_config_box(tmp_path: Path):
     video = parse_file(resolve_output(playlist).init).video
     assert video.sample_entry_type == "dvh1", "fourcc 改名与配置 box 是两件事"
     assert video.dvcc is None, "少了 -strict unofficial 却写出了配置 box，说明判据失效"
-    assert video.signalling == "dvh1 但缺 dvvC"
+    assert video.signalling == "dvh1 但缺 dvC"
