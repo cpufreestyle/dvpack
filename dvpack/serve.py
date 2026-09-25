@@ -231,7 +231,9 @@ def _windows_iface_addresses() -> list[str]:
     )
 
     class IP_ADAPTER_INFO(ctypes.Structure):
-        _fields_ = (
+        pass
+
+    IP_ADAPTER_INFO._fields_ = (
             ("Next", ctypes.POINTER(IP_ADAPTER_INFO)),
             ("ComboIndex", ctypes.c_ulong),
             ("AdapterName", ctypes.c_char * 256),
@@ -250,7 +252,7 @@ def _windows_iface_addresses() -> list[str]:
             ("SecondaryWinsServer", IP_ADDR_STRING),
             ("LeaseObtained", ctypes.c_ulonglong),
             ("LeaseExpires", ctypes.c_ulonglong),
-        )
+    )
 
     iphlpapi = ctypes.WinDLL("iphlpapi")
     GetAdaptersInfo = iphlpapi.GetAdaptersInfo
