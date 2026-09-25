@@ -13,6 +13,13 @@ from functools import partial
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+import json
+import re
+import threading
+from urllib.parse import parse_qs, urlsplit
+
+from .jfpack import JfPackError, pack_source
+
 # Windows 的注册表常把 .m3u8 映射成乱七八糟的类型，所以不用 mimetypes，显式给表。
 MIME_TYPES = {
     ".m3u8": "application/vnd.apple.mpegurl",
@@ -24,6 +31,62 @@ MIME_TYPES = {
 }
 
 FULL, PARTIAL, UNSATISFIABLE = "full", "partial", "unsatisfiable"
+
+# /jf/pack：Jellyfin 片源按需打包端点。电视侧只出一个地址，片源在 Jellyfin
+# （Docker）里、容器是 mkv、AVPlayer 不认——由这个端点现打现取。
+JFPACK_PATH = "/jf/pack"
+ID_PATTERN = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
+SECONDS_LIMITS = (1.0, 600.0)
+
+_PACK_LOCKS_GUARD = threading.Lock()
+_PACK_LOCKS: dict[str, threading.Lock] = {}
+
+
+def _valid_pack_src(src: str) -> bool:
+    """只放行 http(s) 且解析后全部落在 RFC1918 私网的地址（防 SSRF）。
+
+    serve 听在 0.0.0.0 上，公网地址必须挡掉；主机名解析后逐个校验，
+    只卡字面量 IP 挡不住 DNS 指向公网的域名。
+    """
+    try:
+        parts = urlsplit(src)
+    except ValueError:
+        return False
+    if parts.scheme not in ("http", "https") or not parts.hostname:
+        return False
+    try:
+        infos = socket.getaddrinfo(parts.hostname, parts.port or 80, proto=socket.IPPROTO_TCP)
+    except socket.gaierror:
+        return False
+    addresses = {info[4][0] for info in infos}
+    return bool(addresses) and all(_is_private_ipv4(addr) for addr in addresses)
+
+
+def _src_fingerprint(src: str) -> str:
+    """缓存指纹不带 api_key：token 是会过期的秘密，不落盘。"""
+    parts = urlsplit(src)
+    kept = [item for item in parts.query.split("&") if not item.lower().startswith("api_key=")]
+    return parts._replace(query="&".join(kept)).geturl()
+
+
+def _pack_lock_for(item_id: str) -> threading.Lock:
+    with _PACK_LOCKS_GUARD:
+        lock = _PACK_LOCKS.get(item_id)
+        if lock is None:
+            lock = threading.Lock()
+            _PACK_LOCKS[item_id] = lock
+        return lock
+
+
+def _cache_fresh(out_dir: Path, src: str, seconds: float) -> bool:
+    marker = out_dir / "source.json"
+    if not (out_dir / "master.m3u8").exists() or not marker.exists():
+        return False
+    try:
+        meta = json.loads(marker.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    return meta.get("src") == _src_fingerprint(src) and meta.get("seconds") == seconds
 
 
 @dataclass(frozen=True)
@@ -72,6 +135,9 @@ class HlsRequestHandler(SimpleHTTPRequestHandler):
         return MIME_TYPES.get(Path(path).suffix.lower()) or super().guess_type(path)
 
     def do_GET(self) -> None:
+        if self.path.split("?")[0] == JFPACK_PATH:
+            self._jf_pack()
+            return
         self._respond(body=True)
 
     def do_HEAD(self) -> None:
@@ -117,6 +183,54 @@ class HlsRequestHandler(SimpleHTTPRequestHandler):
 
     def _pipe(self, handle, remaining: int, chunk: int = 256 * 1024) -> None:
         stream_file(handle, self.wfile, remaining, chunk=chunk)
+
+    def _jf_pack(self) -> None:
+        query = parse_qs(urlsplit(self.path).query)
+        src = (query.get("src") or [""])[0]
+        item_id = (query.get("id") or [""])[0]
+        raw_seconds = (query.get("seconds") or ["60"])[0]
+        if not _valid_pack_src(src):
+            self.send_error(400, "src must be a private-network http url")
+            return
+        if not ID_PATTERN.match(item_id):
+            self.send_error(400, "bad item id")
+            return
+        # 点号过得 ID_PATTERN，但纯点号 id（..、...）会把 out_dir 变成
+        # <root>/_jf/.. ——即静态根目录本身，打包产物直接写进 serve 根
+        if set(item_id) <= {"."}:
+            self.send_error(400, "bad item id")
+            return
+        try:
+            seconds = min(SECONDS_LIMITS[1], max(SECONDS_LIMITS[0], float(raw_seconds)))
+        except ValueError:
+            self.send_error(400, "bad seconds")
+            return
+
+        out_dir = Path(self.directory) / "_jf" / item_id
+        # 同一个 item 的请求（电视重试、点完再点）串行化，避免并发写同一份包
+        with _pack_lock_for(item_id):
+            if not _cache_fresh(out_dir, src, seconds):
+                try:
+                    pack_source(
+                        src,
+                        out_dir,
+                        seconds=seconds,
+                        master_uri=f"/_jf/{item_id}/video.m3u8",
+                    )
+                except JfPackError:
+                    self.send_error(502, "pack failed")
+                    return
+                # 指纹不带 api_key，见 _src_fingerprint
+                out_dir.joinpath("source.json").write_text(
+                    json.dumps({"src": _src_fingerprint(src), "seconds": seconds}),
+                    encoding="utf-8",
+                )
+        # 302 让绝对路径的 master 落地；URLSession（ManifestInspector）与
+        # AVPlayer 都会自动跟随
+        self.send_response(302)
+        self.send_header("Location", f"/_jf/{item_id}/master.m3u8")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
 
 
 def stream_file(handle, sink, remaining: int, *, chunk: int = 256 * 1024) -> int:

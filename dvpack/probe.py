@@ -229,10 +229,22 @@ def parse_probe_json(obj: dict, path: Path) -> SourceInfo:
 
 
 def probe(path: str | Path) -> SourceInfo:
-    """调用 ffprobe 探测一个文件。"""
+    """调用 ffprobe 探测一个本地文件。"""
     path = Path(path)
     if not path.exists():
         raise FileNotFoundError(path)
+    return parse_probe_json(ffprobe_json(path), path)
+
+
+def ffprobe_json(source: str | Path) -> dict:
+    """ffprobe 直读一个本地文件或 http(s) 地址，返回原始 JSON。
+
+    Jellyfin 片源在 Mac 上没有本地路径，dvpack.jfpack 靠这层直读 URL；
+    `probe()` 只服务本地文件（它必须先 path.exists()），两者共用同一份 argv。
+
+    远程输入不加 `-timeout`：局域网里的 5GB MKV 单次探测实测数秒完成，
+    加超时反而会把"片源还没索引完"误判成失败。
+    """
     argv = [
         str(require(FFPROBE)),
         "-v",
@@ -243,12 +255,12 @@ def probe(path: str | Path) -> SourceInfo:
         "-show_streams",
         "-show_entries",
         SHOW_ENTRIES,
-        str(path),
+        str(source),
     ]
     proc = subprocess.run(argv, capture_output=True, text=True, encoding="utf-8")
     if proc.returncode != 0 or not proc.stdout.strip():
-        raise NotProbeable(f"ffprobe 失败（{proc.returncode}）：{path}")
-    return parse_probe_json(json.loads(proc.stdout), path)
+        raise NotProbeable(f"ffprobe 失败（{proc.returncode}）：{source}")
+    return json.loads(proc.stdout)
 
 
 def mvp_verdict(source: SourceInfo) -> Verdict:
