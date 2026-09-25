@@ -62,17 +62,25 @@ def convert_to_single_layer(raw: Path, out: Path, dovi_tool: str, *, mode: int =
         raise SystemExit(f"dovi_tool convert 失败：{proc.stderr.strip() or '未知错误'}")
 
 
-def pack(bl: Path, out_dir: Path, ffmpeg: str) -> Path:
+def pack(bl: Path, out_dir: Path, ffmpeg: str, *, time_base: str = "24000/1001") -> Path:
     """单层 HEVC → CMAF/fMP4 + HLS。flag 依据见 dvpack.remux 的模块注释。
 
     cwd 钉在 out_dir 且 argv 里只给裸文件名：ffmpeg 的 init.mp4 按 **当前目录**
     落盘，给绝对路径会掉到别处去（dvpack.remux 里同一条实测）。
+
+    setts 位流过滤器不能去：dovi_tool 输出的裸 HEVC 没有任何 pts（raw demuxer
+    不产时间戳，实测 packet pts 全 N/A），hls muxer 于是写出 EXTINF:0.000000、
+    TARGETDURATION:0——RFC 8216 要求正整数，AVPlayer 直接当非法列表：电视只
+    轮询 media playlist、永远不拉 init.mp4 和分片（2026-09-25 真机实证，serve
+    日志里 playlist 请求每秒级重试、零分片请求）。setts 按帧序号补 CFR 时间戳，
+    零重编码、码流一字节不动。
     """
     out_dir = out_dir.resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
     argv = [
         ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
         "-i", str(bl), "-map", "0:v:0", "-c", "copy",
+        "-bsf:v", f"setts=time_base={time_base}:ts=N:duration=1",
         "-tag:v", "dvh1", "-strict", "unofficial",
         "-f", "hls", "-hls_segment_type", "fmp4",
         "-hls_flags", "independent_segments",
@@ -115,13 +123,22 @@ def main() -> int:
     source = probe(args.src)
     level = source.dovi.level if source.dovi else 6
 
+    fps_json = json.loads(
+        subprocess.run(
+            [ffprobe, "-v", "quiet", "-print_format", "json", "-show_streams",
+             "-select_streams", "v:0", str(args.src)],
+            capture_output=True, text=True, encoding="utf-8",
+        ).stdout
+    )["streams"][0]
+    time_base = fps_json.get("r_frame_rate") or "24000/1001"
+
     with tempfile.TemporaryDirectory() as tmp:
         raw = Path(tmp) / "bl_el.hevc"
         mel = Path(tmp) / "mel.hevc"
         extract_es(args.src, raw, args.seconds, ffmpeg)
         convert_to_single_layer(raw, mel, dovi_tool, mode=args.mode)
 
-        playlist = pack(mel, args.out, ffmpeg)
+        playlist = pack(mel, args.out, ffmpeg, time_base=time_base)
         output = resolve_output(playlist)
 
         # 裸 HEVC 输入没有 DOVI 配置 box：按 Apple 官方模板造一个插进去
