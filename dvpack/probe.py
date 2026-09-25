@@ -254,11 +254,13 @@ def probe(path: str | Path) -> SourceInfo:
 def mvp_verdict(source: SourceInfo) -> Verdict:
     """MVP 只覆盖单层 BL+RPU 的 Profile 5 / 8。
 
-    Profile 8 允许打包但必须带警告：Apple HLS Authoring Specification
-    §1.9 规定 HLS 里的杜比视界 MUST be Profile 5（≤Level 7），
-    P8 单层（HDR10 兼容）在 tvOS 上只被当 HDR10 播放，DV 徽标不亮。
-    2026-09-25 真机实测（Apple TV 4K/tvOS 27.2 + DV 电视）：P8 打包物
-    复判齐全（dvh1/dvcC/PQ/RPU）依然不亮，换 P5 信令后预期点亮。
+    Profile 8 允许打包，但会带一句归因说明：Apple HLS Authoring
+    Specification §1.9 规定 HLS 里的杜比视界 MUST be Profile 5（≤Level 7），
+    P8 单层在 tvOS 上只被当 HDR10 播放、徽标不亮。
+    2026-09-25 真机实测（Apple TV 4K / tvOS 27.2 + DV 电视）：P8 打包物
+    复判齐全依然不亮；同月深夜定位到 ffmpeg 写的是 box 俗名 `dvvC`，而 Apple
+    官方 P5 参考流用的是规范名 `dvcC`（ffprobe 两种都读，本地无法发现）。
+    现在的处置是把 init 段转签成 P5（见 dvpack.p5），是否点亮待真机确认。
     """
     dovi = source.dovi
     if dovi is None:
@@ -276,9 +278,9 @@ def mvp_verdict(source: SourceInfo) -> Verdict:
     warnings: list[str] = []
     if dovi.profile == 8:
         warnings.append(
-            "Profile 8（单层 HDR10 兼容）：Apple HLS 规范 §1.9 要求 DV MUST be "
-            "Profile 5（≤Level 7），tvOS 只按 HDR10 播放，DV 徽标不亮——"
-            "要徽标请换 Profile 5（≤L7）片源，或只把本包当 HDR10 兼容层用"
+            "Profile 8（单层 HDR10 兼容）：Apple 规范 §1.9 要求 DV MUST be Profile 5，"
+            "打包时会把 init 段转签成 P5（dvcC，逐字节对照过 Apple 官方 P5 参考流）——"
+            "tvOS 侧是否点亮待真机确认；不应期就把本包当 HDR10 兼容层用"
         )
     if dovi.profile == 5 and dovi.level in _RISKY_P5_LEVELS:
         warnings.append(

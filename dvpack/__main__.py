@@ -29,7 +29,11 @@ def _check(path: Path) -> int:
     for warning in verdict.warnings:
         print(f"  风险     : {warning}")
     if verdict.supported:
-        print(f"  CODECS   : {dovi.target_apple_codec}")
+        # CODECS 报的是**打包后**的值：单层 P8/P7 会被转签成 P5（Apple §1.9 只认 P5）
+        target = dovi.profile5_target
+        print(f"  CODECS   : {target.target_apple_codec}")
+        if target != dovi:
+            print(f"             （源是 {dovi.target_apple_codec}，打包时转签成 P5）")
         try:
             print(f"  VIDEO-RANGE: {source.video.apple_video_range}")
         except UnknownTransfer as exc:
