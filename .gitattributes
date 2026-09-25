@@ -1,0 +1,4 @@
+# 本机 core.autocrlf=true，checkout 时会把 .py 写成 CRLF；同一份 dvpack 还要在
+# Mac 上跑端侧实验。锁 LF 让两端字节一致，也让 HLS 列表的换行（dvpack/playlist.py
+# 用 write_bytes 刻意写 LF）和仓库口径统一。
+* text=auto eol=lf
