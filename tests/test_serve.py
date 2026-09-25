@@ -7,14 +7,19 @@ AVPlayer 起播就是靠 `Range: bytes=0-1` 探 init 段，之后按区间取分
 from __future__ import annotations
 
 import http.client
+import ipaddress
+import os
 from pathlib import Path
 
 import pytest
+from dvpack import serve as serve_module
 from dvpack.serve import (
     FULL,
     PARTIAL,
     UNSATISFIABLE,
     ByteRange,
+    _is_private_ipv4,
+    lan_address,
     parse_range,
     serve,
     stream_file,
@@ -177,3 +182,63 @@ def test_client_that_resets_on_first_byte_still_returns_quietly(tmp_path: Path):
     blob.write_bytes(b"\0" * 4096)
     with blob.open("rb") as handle:
         assert stream_file(handle, _FlakySink(0), 4096, chunk=1024) == 0
+
+
+def _patch_ifaces(monkeypatch, addresses):
+    """按当前平台 patch 对应的枚举函数，让用例与操作系统无关。"""
+    name = "_windows_iface_addresses" if os.name == "nt" else "_posix_iface_addresses"
+    monkeypatch.setattr(serve_module, name, lambda: addresses)
+
+
+@pytest.mark.parametrize(
+    ("address", "private"),
+    [
+        ("192.168.1.109", True),
+        ("192.168.255.255", True),
+        ("10.8.0.2", True),
+        ("172.16.0.1", True),
+        ("172.31.255.255", True),
+        ("172.15.0.1", False),
+        ("172.32.0.1", False),
+        ("198.18.0.1", False),  # 基准测试段：TUN 代理的默认网卡地址，不能当 LAN
+        ("127.0.0.1", False),
+        ("169.254.1.1", False),
+        ("8.8.8.8", False),
+        ("192.168.1", False),
+        ("256.0.0.1", False),
+        ("junk", False),
+    ],
+)
+def test_private_ipv4(address, private):
+    """私网判定要排掉 198.18/15——标准库的 ipaddress 把它算 private，正好是坑。"""
+    assert _is_private_ipv4(address) is private
+
+
+def test_lan_address_prefers_192_segment(monkeypatch):
+    """家用路由器绝大多数在 192.168 段，候选里有时它必须赢。"""
+    _patch_ifaces(monkeypatch, ["198.18.0.1", "10.8.0.2", "172.16.3.4", "192.168.1.109"])
+    assert lan_address() == "192.168.1.109"
+
+
+def test_lan_address_prefers_172_over_10(monkeypatch):
+    """没有 192.168 时按 172.16/12 → 10/8 的顺序取，保持跨机确定性。"""
+    _patch_ifaces(monkeypatch, ["10.1.2.3", "172.20.1.1"])
+    assert lan_address() == "172.20.1.1"
+
+
+def test_lan_address_falls_back_to_default_route(monkeypatch):
+    """枚举一无所获（极简容器常见）时退回 UDP connect 探测，保住老行为。"""
+    _patch_ifaces(monkeypatch, [])
+    monkeypatch.setattr(serve_module, "_default_route_address", lambda: "192.168.1.109")
+    assert lan_address() == "192.168.1.109"
+
+
+def test_lan_address_last_resort_is_loopback(monkeypatch):
+    _patch_ifaces(monkeypatch, [])
+    monkeypatch.setattr(serve_module, "_default_route_address", lambda: None)
+    assert lan_address() == "127.0.0.1"
+
+
+def test_lan_address_on_this_host():
+    """本机真跑一遍枚举：必须返回一个可解析的 IPv4 字面量。"""
+    ipaddress.ip_address(lan_address())
