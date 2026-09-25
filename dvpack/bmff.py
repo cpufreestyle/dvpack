@@ -410,3 +410,66 @@ def _annexb_starts(data: bytes) -> list[int]:
         else:
             i += 1
     return starts
+
+
+def insert_box_after(data: bytes, sibling_type: str, new_type: str, payload: bytes) -> bytes:
+    """在 init 段的 moov 里，把一个新 box 插到指定兄弟 box 之后，并修正父链尺寸。
+
+    fMP4 init 段的 moov 是最后一个顶层 box、内部 stbl/stsd 里没有指向 mdat 的
+    chunk offset（ffmpeg 对 fragmented 输出就是这种布局），所以插入只需要把
+    dvh1/stsd/stbl/minf/mdia/trak/moov 的尺寸逐个加上新 box 的长度，
+    不需要重算任何偏移。若不成立，函数宁可报错也不要静默产出错文件。
+    """
+    from struct import pack
+
+    boxes = _scan_buffer(data)
+    if not boxes or boxes[-1][0] != "moov":
+        raise ValueError("只支持 moov 收尾的 init 段；本文件的顶层 box 不是这种布局")
+    moov_offset, moov_size = boxes[-1][1], boxes[-1][2]
+    buf = bytearray(data[moov_offset : moov_offset + moov_size])
+    parsed = _parse_box(bytes(buf), 0, len(buf), 1)
+    if parsed is None:
+        raise ValueError("moov 解析失败")
+    target = _find_box(parsed, sibling_type)
+    if target is None:
+        raise ValueError(f"init 段里找不到兄弟 box {sibling_type}")
+
+    insert_at = target.offset + target.size
+    box = bytes(pack(">I", len(payload) + 8)) + new_type.encode("latin-1") + bytes(payload)
+    buf[insert_at:insert_at] = box
+
+    # 父链逐个加长：从包含兄弟 box 的 sample entry 一路到 moov
+    chain = _ancestor_chain(parsed, target)
+    for box_node in chain:
+        off = box_node.offset
+        if off < 0 or buf[off : off + 4] != bytes(pack(">I", box_node.size)):
+            raise ValueError(f"父 box {box_node.type} 的尺寸字段与解析不符，拒绝改写")
+        size = box_node.size + len(box)
+        if size > 0xFFFFFFFF:
+            raise ValueError("尺寸超出 32 位，本项目的载荷远不到这个量级")
+        buf[off : off + 4] = bytes(pack(">I", size))
+
+    return bytes(data[:moov_offset]) + bytes(buf) + bytes(data[moov_offset + moov_size :])
+
+
+def _find_box(root: Box, btype: str) -> Box | None:
+    return next(iter(root.find_all(btype)), None)
+
+
+def _ancestor_chain(root: Box, node: Box) -> tuple[Box, ...]:
+    """node 往上到 moov 的父链（不含 moov 自身，moov 由顶层尺寸统一处理）。"""
+    chain: list[Box] = []
+
+    def walk(current: Box, path: tuple[Box, ...]) -> bool:
+        for child in current.children:
+            if child is node or child.offset == node.offset:
+                chain[:] = path
+                return True
+            if walk(child, path + (child,)):
+                return True
+        return False
+
+    # path 初始就把 root（moov）带上：插 box 会把 moov 自身也撑大，
+    # 少改这一层的话外层按旧尺寸截断，整棵树都不完整。
+    walk(root, (root,))
+    return tuple(reversed(chain))

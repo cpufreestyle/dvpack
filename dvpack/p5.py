@@ -25,7 +25,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
-from .bmff import DvBox, locate_dv_boxes
+from .bmff import DvBox, insert_box_after, locate_dv_boxes
 from .probe import DoviRecord
 
 
@@ -120,6 +120,8 @@ class ResignResult:
 
     def describe(self) -> str:
         mark = "dvvC→dvcC，" if self.renamed else ""
+        if self.box_fourcc == "（原本缺失）":
+            return f"新建 dvcC：P5 L{self.after.level}（ffmpeg 没写配置 box）"
         return (
             f"{mark}P{self.before.profile}→P{self.after.profile}"
             f"（L{self.before.level}→L{self.after.level}）"
@@ -132,6 +134,7 @@ def resign_init_segment(
     profile: int = 5,
     compat_id: int = 0,
     el_present: bool = False,
+    level: int = 6,
 ) -> ResignResult:
     """把 init 段的配置 box 转签成 Apple 规范写法，就地改写。
 
@@ -140,10 +143,34 @@ def resign_init_segment(
     """
     data = init.read_bytes()
     boxes = locate_dv_boxes(data)
-    if not boxes:
-        raise ResignError(f"{init.name} 里没有 DV 配置 box，无从转签")
     if len(boxes) > 1:
         raise ResignError(f"{init.name} 里有 {len(boxes)} 个 DV 配置 box，多轨 DV 产物不在 MVP 范围")
+
+    created = not boxes
+    if created:
+        # 裸 HEVC 输入不带 DOVI 侧数据，ffmpeg 一个 box 都不写：自己按 Apple 模板造。
+        # level 由调用方从源探测给出（ffprobe 的 dv_level），不靠猜。
+        record = DvcConfig(
+            version_major=1, version_minor=0, profile=profile, level=level,
+            rpu_present=True, el_present=el_present, bl_present=True,
+            # 尾巴 19 个零：凑成 Apple 官方 L6 模板的 24 字节总长
+            compat_id=compat_id, tail=b"\0" * 19,
+        )
+        try:
+            data = insert_box_after(data, "hvcC", "dvcC", record.encode())
+        except ValueError as exc:
+            raise ResignError(f"插入 dvcC 失败：{exc}") from exc
+        before = DoviRecord(
+            profile=0, level=level, rpu_present=False, el_present=el_present,
+            bl_present=False, compat_id=-1, md_compression="none", spec_version="1.0",
+        )
+        after = record.to_dovi_record()
+        init.write_bytes(bytes(data))
+        return ResignResult(
+            path=init, box_fourcc="（原本缺失）", before=before, after=after,
+            renamed=False,
+        )
+
 
     box: DvBox = boxes[0]
     before = DvcConfig.parse(box.payload).to_dovi_record()

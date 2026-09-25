@@ -106,11 +106,26 @@ def test_resign_is_idempotent(tmp_path: Path):
     assert result.before == result.after
 
 
-def test_resign_without_box_is_an_error(tmp_path: Path):
+def test_resign_creates_box_when_ffmpeg_wrote_none(tmp_path: Path):
+    """裸 HEVC 输入 → ffmpeg 不写 dvcC：必须自己按 Apple 模板造一个插进 dvh1。
+
+    这是 P7→P5 通路的必经步骤：丢 EL 之后的码流喂给 ffmpeg 时没有任何 DOVI
+    侧数据，init 段里只有 hvcC，没有配置 box，电视永远走不到 DV 分支。
+    """
     init = tmp_path / "init.mp4"
     init.write_bytes(_file("dvh1", _box("hvcC", b"\x01\x02")))
-    with pytest.raises(ResignError, match="没有 DV 配置 box"):
-        resign_init_segment(init)
+    result = resign_init_segment(init, level=6)
+    data = init.read_bytes()
+    assert b"dvcC" in data
+    assert result.after == P5_RECORD
+
+    from dvpack.bmff import parse_file
+
+    video = parse_file(init).video
+    assert video.sample_entry_children == ("hvcC", "dvcC")
+    assert video.dv_box == "dvcC"
+    # 与 Apple 官方 L6 参考同字节
+    assert bytes.fromhex(APPLE_P5_L6)[:5] in data
 
 
 def test_resign_pack_skips_sources_already_p5():

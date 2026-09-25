@@ -14,7 +14,14 @@ import pytest
 from dvpack.bmff import locate_dv_boxes, parse_file
 from dvpack.p5 import DvcConfig
 from dvpack.probe import parse_probe_json
-from dvpack.remux import RemuxError, hls_command, remux, remux_and_verify, resolve_output
+from dvpack.remux import (
+    RemuxError,
+    check_rpu_consistency,
+    hls_command,
+    remux,
+    remux_and_verify,
+    resolve_output,
+)
 from dvpack.tools import FFMPEG
 
 SRC = Path(os.environ.get("DVPACK_SOURCE_MKV", ""))
@@ -74,7 +81,6 @@ def test_remux_refuses_non_dovi_source(monkeypatch, tmp_path: Path):
 
 
 @needs_source
-@needs_source
 def test_end_to_end_resign_lands_on_apple_template(tmp_path: Path):
     """转签落地的端到端判据：init 段的 dvcC 必须逐字节等于 Apple 官方 P5 模板。
 
@@ -88,6 +94,47 @@ def test_end_to_end_resign_lands_on_apple_template(tmp_path: Path):
             record.bl_present, record.compat_id) == (5, record.level, True, False, True, 0)
     assert record.encode()[:5].hex().startswith("01000a35"), record.encode().hex()
     assert b"dvcC" in data and b"dvvC" not in data
+
+
+@needs_source
+def test_end_to_end_rpu_is_self_consistent_for_profile_5(tmp_path: Path):
+    """单层 P5 的 RPU 必须自洽——这是"徽标能不能亮"的可观测代理。
+
+    P7 源丢 EL 后 RPU 仍带 NLQ、未禁用残差，是伪 P5，tvOS 拒播；真机实验的
+    教训就是别只信信令。这条保证 P8 通路的产物不犯同一个错。
+    """
+    _, output = remux(SRC, tmp_path, seconds=6, segment_seconds=2)
+    assert check_rpu_consistency(output) == ()
+
+
+_P7_SRC = Path(os.environ.get("DVPACK_SOURCE_P7_MKV", ""))
+
+needs_p7_source = pytest.mark.skipif(
+    not (_P7_SRC.is_file() and FFMPEG.exists()), reason="缺 P7 片源或 ffmpeg"
+)
+
+
+@needs_p7_source
+def test_verify_reports_inconsistent_rpu_as_problem(tmp_path: Path):
+    """反面控制：mode 1 造出来的伪 P5 必须被 RPU 自洽性判据抓到。
+
+    真机教训：P7 源丢 EL 后 RPU 仍是 nlq=linear_dz、残差未禁用——信令转签得
+    再看不出破绽，tvOS 也拒播。mode 5 是修复姿势（nlq=none + 残差禁用）：
+    这条用例走同一条链路、只把 dovi_tool convert 的模式换成 1，保证判据
+    闻得出没走 mode 5 的产物。
+    """
+    import subprocess
+    import sys
+
+    out = tmp_path / "dv_p7"
+    proc = subprocess.run(
+        [sys.executable, "scripts/p7_to_p5.py", str(_P7_SRC), "-o", str(out), "--seconds", "6", "--mode", "1"],
+        capture_output=True, text=True, encoding="utf-8",
+    )
+    assert proc.returncode == 0, proc.stderr
+    output = resolve_output(out / "video.m3u8")
+    problems = check_rpu_consistency(output)
+    assert any("RPU" in problem for problem in problems), problems
 
 
 def test_end_to_end_produces_dvh1_with_config_box(tmp_path: Path):

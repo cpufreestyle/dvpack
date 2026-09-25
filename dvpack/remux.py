@@ -14,6 +14,7 @@ Shaka Packager 3.9.3 走同一条路（先 ffmpeg 打标再 packager）产出的
 
 from __future__ import annotations
 
+import json
 import re
 import subprocess
 from dataclasses import dataclass
@@ -22,7 +23,7 @@ from pathlib import Path
 from .bmff import parse_file
 from .p5 import resign_pack
 from .probe import DoviRecord, SourceInfo, mvp_verdict, probe
-from .tools import FFMPEG, require
+from .tools import FFPROBE, FFMPEG, require
 
 # 见模块 docstring 第 2、3 条：缺任一条都不会得到合法 DV 信令
 DV_VIDEO_FLAGS = ("-tag:v", "dvh1", "-strict", "unofficial")
@@ -104,6 +105,66 @@ def hls_command(
 
 def _run(argv: list[str], cwd: Path | None = None) -> subprocess.CompletedProcess:
     return subprocess.run(argv, capture_output=True, text=True, encoding="utf-8", cwd=cwd)
+
+
+# Profile 5 单层的 RPU 必须自洽：不能带 NLQ，且残差（增强层）必须声明禁用。
+# 2026-09-25 实测：P7 源（Halo）丢 EL 后 RPU 仍是 nlq=linear_dz、
+# disable_residual_flag=0——伪 P5，tvOS 拒播。P8 源是 nlq=none、
+# disable_residual=1，真单层自洽。这两个字段是"重签不自洽"的可观测代理。
+_SELF_CONSISTENT_NLQ = "none"
+
+
+def check_rpu_consistency(output: RemuxOutput, *, frames: int = 4) -> tuple[str, ...]:
+    """读前几帧的 RPU 侧数据，判断单层 P5 的 RPU 是否自洽。返回问题列表。
+
+    只取前几帧：DV 流的 RPU 参数逐帧相同的情况占绝大多数，真逐帧不同时
+    至少能抓到 IDR 那一帧；为省时间不做全片扫描。
+    """
+    argv = [
+        str(require(FFPROBE)),
+        "-v",
+        "quiet",
+        "-select_streams",
+        "v:0",
+        "-show_frames",
+        "-show_entries",
+        "frame=side_data_list",
+        "-read_intervals",
+        f"%+#{frames}",
+        "-of",
+        "json",
+        str(output.playlist),
+    ]
+    proc = subprocess.run(argv, capture_output=True, text=True, encoding="utf-8")
+    if proc.returncode != 0:
+        return (f"ffprobe 读分片 RPU 失败：{proc.stderr.strip() or '未知错误'}",)
+
+    problems: list[str] = []
+    seen: set[tuple[object, object]] = set()
+    try:
+        frames_json = json.loads(proc.stdout).get("frames") or []
+    except json.JSONDecodeError:
+        return ("分片 RPU 侧数据不是合法 JSON",)
+
+    for frame in frames_json:
+        for sidedata in frame.get("side_data_list") or []:
+            if sidedata.get("side_data_type") != "Dolby Vision Metadata":
+                continue
+            nlq = sidedata.get("nlq_method_idc_name")
+            residual = sidedata.get("disable_residual_flag")
+            if (nlq, residual) in seen:
+                continue
+            seen.add((nlq, residual))
+            if nlq is not None and nlq != _SELF_CONSISTENT_NLQ:
+                problems.append(
+                    f"RPU 带 NLQ（{nlq}）：Profile 5 单层不能有 NLQ"
+                )
+            if residual is not None and not int(residual):
+                problems.append(
+                    "RPU 未禁用残差（disable_residual_flag=0）：码流缺增强层，"
+                    "RPU 与码流不自洽，tvOS 会拒播"
+                )
+    return tuple(problems)
 
 
 def resolve_output(playlist: Path) -> RemuxOutput:
@@ -191,6 +252,10 @@ def verify(source: SourceInfo, output: RemuxOutput, *, target: DoviRecord | None
         problems.append(f"ffprobe 读 init 段失败：{type(exc).__name__}")
     if out_dovi != expected:
         problems.append(f"DoviRecord 不符：目标 {expected} ≠ 产出 {out_dovi}")
+
+    if out_dovi is not None and not out_dovi.el_present:
+        # 单层 RPU 必须自洽，否则就是"伪 P5"——信令看着对，tvOS 拒播
+        problems.extend(check_rpu_consistency(output))
 
     return Verification(
         ok=not problems,
