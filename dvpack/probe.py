@@ -231,7 +231,14 @@ def probe(path: str | Path) -> SourceInfo:
 
 
 def mvp_verdict(source: SourceInfo) -> Verdict:
-    """MVP 只覆盖单层 BL+RPU 的 Profile 5 / 8。"""
+    """MVP 只覆盖单层 BL+RPU 的 Profile 5 / 8。
+
+    Profile 8 允许打包但必须带警告：Apple HLS Authoring Specification
+    §1.9 规定 HLS 里的杜比视界 MUST be Profile 5（≤Level 7），
+    P8 单层（HDR10 兼容）在 tvOS 上只被当 HDR10 播放，DV 徽标不亮。
+    2026-09-25 真机实测（Apple TV 4K/tvOS 27.2 + DV 电视）：P8 打包物
+    复判齐全（dvh1/dvcC/PQ/RPU）依然不亮，换 P5 信令后预期点亮。
+    """
     dovi = source.dovi
     if dovi is None:
         return Verdict(False, "无 DOVI configuration record，不是杜比视界片源")
@@ -246,6 +253,12 @@ def mvp_verdict(source: SourceInfo) -> Verdict:
         return Verdict(False, f"Profile {dovi.profile} 不在 MVP 范围（仅 5 / 8）")
 
     warnings: list[str] = []
+    if dovi.profile == 8:
+        warnings.append(
+            "Profile 8（单层 HDR10 兼容）：Apple HLS 规范 §1.9 要求 DV MUST be "
+            "Profile 5（≤Level 7），tvOS 只按 HDR10 播放，DV 徽标不亮——"
+            "要徽标请换 Profile 5（≤L7）片源，或只把本包当 HDR10 兼容层用"
+        )
     if dovi.profile == 5 and dovi.level in _RISKY_P5_LEVELS:
         warnings.append(
             f"level {dovi.level}：Infuse 社区报告 Profile 5 在此 level 不点亮 DV，"

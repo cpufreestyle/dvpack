@@ -55,6 +55,11 @@ P8_L7["side_data_list"][0].update(
     {"dv_profile": 8, "dv_level": 7, "dv_bl_signal_compatibility_id": 1}
 )
 
+P8_L6 = copy.deepcopy(P5_L6)
+P8_L6["side_data_list"][0].update(
+    {"dv_profile": 8, "dv_level": 6, "dv_bl_signal_compatibility_id": 1}
+)
+
 DUAL_LAYER_P7 = copy.deepcopy(P5_L6)
 DUAL_LAYER_P7["side_data_list"][0].update(
     {"dv_profile": 7, "dv_level": 6, "el_present_flag": 1}
@@ -167,12 +172,27 @@ def test_p5_level9_is_supported_but_flagged_as_risk():
 
 
 def test_p8_level7_is_not_flagged_because_that_level_is_normal_for_p8():
-    """风险项来自"Profile 5 在 level 7/9 不点亮 DV"的报告，套到 P8 上就是噪音。
+    """level 7/9 风险项是 P5 专属，套到 P8 上是噪音。
 
-    片库里 P8 L7 有 2 个文件（我们的验收对象之一），以前每次跑矩阵都被误报一次。
+    P8 现在换成了结构性的"Apple 规范只认 P5"警告（见下一个用例），
+    但不应再掺 level 相关的误报。
     """
     verdict = mvp_verdict(parse_probe_json(_wrap(P8_L7), Path("x.mkv")))
-    assert verdict.supported and verdict.warnings == ()
+    assert verdict.supported
+    assert any("Profile 5" in w for w in verdict.warnings)
+    assert not any("level" in w for w in verdict.warnings)
+
+
+def test_p8_single_layer_is_supported_but_warned_apple_requires_p5():
+    """Apple HLS Authoring Specification §1.9：HLS 里的 DV MUST be Profile 5（≤Level 7）。
+
+    2026-09-25 真机实测（Apple TV 4K / tvOS 27.2 / DV 电视，dvh1+dvcC+PQ+RPU
+    信令齐全的 P8 打包物）：tvOS 只按 HDR10 播放，DV 徽标不亮。
+    打包仍放行——P8 包可当 HDR10 兼容层用——但必须带归因警告。
+    """
+    verdict = mvp_verdict(parse_probe_json(_wrap(P8_L6), Path("x.mkv")))
+    assert verdict.supported
+    assert any("Profile 5" in w and "HDR10" in w for w in verdict.warnings)
 
 
 def test_dual_layer_profile_7_is_refused():
