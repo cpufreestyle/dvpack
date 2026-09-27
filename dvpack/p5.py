@@ -25,7 +25,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
-from .bmff import DvBox, insert_box_after, locate_dv_boxes
+from .bmff import DvBox, atomic_write, insert_box_after, locate_dv_boxes
 from .probe import DoviRecord
 
 
@@ -165,7 +165,7 @@ def resign_init_segment(
             bl_present=False, compat_id=-1, md_compression="none", spec_version="1.0",
         )
         after = record.to_dovi_record()
-        init.write_bytes(bytes(data))
+        atomic_write(init, data)
         return ResignResult(
             path=init, box_fourcc="（原本缺失）", before=before, after=after,
             renamed=False,
@@ -196,7 +196,7 @@ def resign_init_segment(
     patched[start : start + len(after_config.encode())] = after_config.encode()
     if len(patched) != len(data):
         raise ResignError("转签后文件长度变了，box 尺寸必须原样保住")
-    init.write_bytes(bytes(patched))
+    atomic_write(init, patched)
     return ResignResult(
         path=init,
         box_fourcc=box.fourcc,

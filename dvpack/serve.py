@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import os
 import socket
+import traceback
 from dataclasses import dataclass
 from functools import partial
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
@@ -19,6 +20,9 @@ import threading
 from urllib.parse import parse_qs, urlsplit
 
 from .jfpack import JfPackError, pack_source
+from .p5 import ResignError
+from .probe import NotProbeable
+from .remux import RemuxError
 
 # Windows 的注册表常把 .m3u8 映射成乱七八糟的类型，所以不用 mimetypes，显式给表。
 MIME_TYPES = {
@@ -37,6 +41,11 @@ FULL, PARTIAL, UNSATISFIABLE = "full", "partial", "unsatisfiable"
 JFPACK_PATH = "/jf/pack"
 ID_PATTERN = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
 SECONDS_LIMITS = (1.0, 600.0)
+
+# pack_source 的已知失败面。catch 不全就会炸穿连接——真链路实测过：
+# NotProbeable 穿堂而过，客户端只收到 http 000，serve 日志只剩半截。
+# 2026-09-26：launchd 出站被 TCC 拦成 EHOSTUNREACH，就是这个报文形状。
+PACK_ERRORS = (JfPackError, NotProbeable, RemuxError, ResignError, ValueError)
 
 _PACK_LOCKS_GUARD = threading.Lock()
 _PACK_LOCKS: dict[str, threading.Lock] = {}
@@ -144,8 +153,10 @@ class HlsRequestHandler(SimpleHTTPRequestHandler):
         self._respond(body=False)
 
     def _cache_header(self) -> str:
-        # 列表会变（尤其以后做直播式分片追加），分片不会
-        return "no-store" if self.path.split("?")[0].endswith(".m3u8") else "public, max-age=3600"
+        # 一律 no-store：重打包会换掉 init 段口径（2026-09-26 换 range 重打包，
+        # ATV 握着 max-age=3600 的旧 init 就是「颜色不对 + 不亮」的复发现场）。
+        # 局域网带宽不是瓶颈，缓存命中也换不来什么。
+        return "no-store"
 
     def _respond(self, *, body: bool) -> None:
         filesystem = self.translate_path(self.path)
@@ -217,7 +228,10 @@ class HlsRequestHandler(SimpleHTTPRequestHandler):
                         seconds=seconds,
                         master_uri=f"/_jf/{item_id}/video.m3u8",
                     )
-                except JfPackError:
+                except PACK_ERRORS:
+                    # 端点必须回 502，不能把连接掐断（客户端只见 http 000）；
+                    # 真实原因落进 serve 日志，排障不再现场全盲。
+                    traceback.print_exc()
                     self.send_error(502, "pack failed")
                     return
                 # 指纹不带 api_key，见 _src_fingerprint

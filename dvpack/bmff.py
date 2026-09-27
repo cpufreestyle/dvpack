@@ -12,6 +12,7 @@ DoviRecord 请用 dvpack.probe——两边都走同一个 ffprobe，差异只可
 
 from __future__ import annotations
 
+import os
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
@@ -38,6 +39,10 @@ _RPU_NAL_TYPES = frozenset({62, 63})  # HEVC unregistered prefix / suffix NAL，
 # type 62 的 NAL header 是 `7c 01`，其后第一个 payload 字节是 rpu_nal_prefix=25。
 # 实测自本机片源，且与 dovi_tool `info` 输出的 rpu_nal_prefix 一致。
 _RPU_NAL_PREFIX = 0x19
+
+# VPS(32)/SPS(33)/PPS(34)：Apple HLS/fMP4 要求 init 段 hvcC 自带的必需参数集，
+# drop_hvcC_param_set_type 拒绝删除这三类，防调用方误用毁掉解码信令。
+_MANDATORY_PARAM_SETS = frozenset({32, 33, 34})
 
 
 @dataclass(frozen=True)
@@ -473,3 +478,339 @@ def _ancestor_chain(root: Box, node: Box) -> tuple[Box, ...]:
     # 少改这一层的话外层按旧尺寸截断，整棵树都不完整。
     walk(root, (root,))
     return tuple(reversed(chain))
+
+
+def hvcC_param_set_types(data: bytes) -> tuple[int, ...]:
+    """init 段 hvcC 里已收录的参数集 NAL 类型（去重升序）；没有 hvcC 或无参数集时返回 ()。
+
+    判据用途：Apple HLS/fMP4 要求 init 段的 hvcC 自带 VPS(32)/SPS(33)/PPS(34)。
+    2026-09-26 真机实证：MKV 源 extradata 只有 23 字节 hvcC 头（numOfArrays=0）时，
+    tvOS 拉到 init.mp4 200 + video0.m4s 200 后再也不拉下一分片——分片里 in-band
+    参数集明明齐全（nal_types 32/33/34 都有），但 Apple 不从分片反哺 init，
+    "播了但立刻失败"就是这么来的。
+    """
+    trees = _parse_siblings(data, 0, len(data), 1)
+    hvcc = next((box for tree in trees for box in tree.find_all("hvcC")), None)
+    if hvcc is None:
+        return ()
+    payload = data[hvcc.offset + 8 : hvcc.offset + hvcc.size]
+    if len(payload) < 23:
+        return ()
+    types: list[int] = []
+    cursor = 23
+    for _ in range(payload[22]):
+        if cursor + 3 > len(payload):
+            break
+        nal_type = payload[cursor] & 0x3F
+        count = int.from_bytes(payload[cursor + 1 : cursor + 3], "big")
+        cursor += 3
+        for _ in range(count):
+            if cursor + 2 > len(payload):
+                break
+            length = int.from_bytes(payload[cursor : cursor + 2], "big")
+            cursor += 2
+            if cursor + length > len(payload):
+                break
+            # NAL 头第 1 字节：forbidden(1)+type(6)，类型在高 6 位，要右移
+            if (payload[cursor] >> 1) & 0x3F == nal_type:
+                types.append(nal_type)
+            cursor += length
+    return tuple(sorted(set(types)))
+
+
+def dedupe_hvcC_parameter_sets(data: bytes) -> tuple[bytes, int]:
+    """hvcC 参数集数组去重：每种 NAL 类型只留第一条，返回 (新 bytes, 删除条数)。
+
+    ffmpeg 写的 hvcC 把 VPS(32)/SPS(33)/PPS(34) 各写两份，Apple 官方参考流
+    （adv_dv_atmos）各只一条——2026-09-25 逐 box A/B 实测这是我们 init 段与
+    Apple 模板的唯一剩余差异（段内 VPS/SPS/PPS 重复已由 filter_units 三链清零，
+    见 scripts/p7_to_p5.py 的 hls 步骤）。tvOS 是否因重复拒走 DV 直通未知，
+    先做字节级对齐再真人验证。
+
+    手术法同 insert_box_after：只动 moov 收尾的 init 段，重写 hvcC 载荷、父链
+    尺寸逐个修正。同类型第 2+ 条与首条**逐字节相同**才删；出现内容不同的第二条
+    参数集时 raise——那不是简单重复，静默丢弃会改解码信令（实测 dv_p7_v3 的
+    init 就有一条 PPS 是首条追加 00 字节的变体，老打包路径产物）。
+    """
+    boxes = _scan_buffer(data)
+    if not boxes or boxes[-1][0] != "moov":
+        raise ValueError("只支持 moov 收尾的 init 段；本文件的顶层 box 不是这种布局")
+    moov_offset, moov_size = boxes[-1][1], boxes[-1][2]
+    buf = bytearray(data[moov_offset : moov_offset + moov_size])
+    parsed = _parse_box(bytes(buf), 0, len(buf), 1)
+    if parsed is None:
+        raise ValueError("moov 解析失败")
+    hvcc = _find_box(parsed, "hvcC")
+    if hvcc is None:
+        raise ValueError("init 段里找不到 hvcC box")
+
+    payload = bytes(buf[hvcc.offset + 8 : hvcc.offset + hvcc.size])
+    if len(payload) < 23:
+        raise ValueError("hvcC 载荷短于 23 字节，不是合法的 HEVCDecoderConfigurationRecord")
+
+    arrays: list[bytes] = []
+    removed = 0
+    cursor = 23
+    for _ in range(payload[22]):
+        if cursor + 3 > len(payload):
+            raise ValueError("hvcC 数组头越界，拒绝改写")
+        header = payload[cursor : cursor + 1]
+        count = int.from_bytes(payload[cursor + 1 : cursor + 3], "big")
+        cursor += 3
+        nals: list[bytes] = []
+        for _ in range(count):
+            if cursor + 2 > len(payload):
+                raise ValueError("hvcC NAL 长度字段越界，拒绝改写")
+            length = int.from_bytes(payload[cursor : cursor + 2], "big")
+            cursor += 2
+            if cursor + length > len(payload):
+                raise ValueError("hvcC NAL 载荷越界，拒绝改写")
+            nals.append(payload[cursor : cursor + length])
+            cursor += length
+        for extra in nals[1:]:
+            if extra != nals[0]:
+                raise ValueError(
+                    f"hvcC 里 NAL type {header[0] & 0x3F} 的第 2+ 条参数集与首条不同，"
+                    "不是简单重复，拒绝去重"
+                )
+            removed += 1
+        kept = nals[:1]
+        rebuilt = header + len(kept).to_bytes(2, "big")
+        for nal in kept:
+            rebuilt += len(nal).to_bytes(2, "big") + nal
+        arrays.append(rebuilt)
+
+    if removed == 0:
+        return data, 0
+    new_payload = payload[:22] + len(arrays).to_bytes(1, "big") + b"".join(arrays)
+    new_box = (len(new_payload) + 8).to_bytes(4, "big") + b"hvcC" + new_payload
+    buf[hvcc.offset : hvcc.offset + hvcc.size] = new_box
+
+    # 父链逐个缩短：从包含 hvcC 的 sample entry 一路到 moov（_ancestor_chain 的
+    # path 初始值就带 moov，所以链尾是它自己）。父 box 的尺寸字段都位于 hvcC
+    # 之前，不受本次改写影响；逐个校验旧值再写新值，不符就拒写。
+    shrink = hvcc.size - len(new_box)
+    for box_node in _ancestor_chain(parsed, hvcc):
+        off = box_node.offset
+        if off < 0 or buf[off : off + 4] != box_node.size.to_bytes(4, "big"):
+            raise ValueError(f"父 box {box_node.type} 的尺寸字段与解析不符，拒绝改写")
+        buf[off : off + 4] = (box_node.size - shrink).to_bytes(4, "big")
+
+    return bytes(data[:moov_offset]) + bytes(buf) + bytes(data[moov_offset + moov_size :]), removed
+
+
+def drop_hvcC_param_set_type(data: bytes, nal_type: int) -> tuple[bytes, int]:
+    """从 init 段 hvcC 里删掉整个指定 NAL 类型的参数集数组，返回 (新 bytes, 删除数组数)。
+
+    变体 B 的依据（2026-09-26 实测）：已验证能播的 1080p 流 hvcC 148B = 仅
+    (32,[24]),(33,[78]),(34,[8])，无 type-39；live 4K 单 entry 包 hvcC 232B
+    = 上述三组 + (39,[6,22,13]) 三个前缀 SEI NAL。剥 39 即与能播模板同构。
+
+    手术法同 dedupe_hvcC_parameter_sets：只动 moov 收尾的 init 段，保留的
+    数组逐字节照抄、numOfArrays 扣减删除数、hvcC 载荷重写、父链尺寸逐个
+    校验后扣减；字段与解析不符即 raise，不静默产出。32/33/34 是 Apple HLS
+    init 段必需参数集，点名要删直接 raise；数组不存在时原样返回、删除数 0
+    （幂等）。
+    """
+    if nal_type in _MANDATORY_PARAM_SETS:
+        raise ValueError("VPS/SPS/PPS(32/33/34) 是 Apple HLS init 段必需参数集，拒绝删除")
+    boxes = _scan_buffer(data)
+    if not boxes or boxes[-1][0] != "moov":
+        raise ValueError("只支持 moov 收尾的 init 段；本文件的顶层 box 不是这种布局")
+    moov_offset, moov_size = boxes[-1][1], boxes[-1][2]
+    buf = bytearray(data[moov_offset : moov_offset + moov_size])
+    parsed = _parse_box(bytes(buf), 0, len(buf), 1)
+    if parsed is None:
+        raise ValueError("moov 解析失败")
+    hvcc = _find_box(parsed, "hvcC")
+    if hvcc is None:
+        raise ValueError("init 段里找不到 hvcC box")
+
+    payload = bytes(buf[hvcc.offset + 8 : hvcc.offset + hvcc.size])
+    if len(payload) < 23:
+        raise ValueError("hvcC 载荷短于 23 字节，不是合法的 HEVCDecoderConfigurationRecord")
+
+    arrays: list[bytes] = []
+    dropped = 0
+    cursor = 23
+    for _ in range(payload[22]):
+        start = cursor
+        if cursor + 3 > len(payload):
+            raise ValueError("hvcC 数组头越界，拒绝改写")
+        array_type = payload[cursor] & 0x3F
+        count = int.from_bytes(payload[cursor + 1 : cursor + 3], "big")
+        cursor += 3
+        for _ in range(count):
+            if cursor + 2 > len(payload):
+                raise ValueError("hvcC NAL 长度字段越界，拒绝改写")
+            length = int.from_bytes(payload[cursor : cursor + 2], "big")
+            cursor += 2
+            if cursor + length > len(payload):
+                raise ValueError("hvcC NAL 载荷越界，拒绝改写")
+            cursor += length
+        if array_type == nal_type:
+            dropped += 1
+        else:
+            arrays.append(payload[start:cursor])
+
+    if dropped == 0:
+        return bytes(data), 0
+    new_payload = payload[:22] + len(arrays).to_bytes(1, "big") + b"".join(arrays)
+    new_box = (len(new_payload) + 8).to_bytes(4, "big") + b"hvcC" + new_payload
+    buf[hvcc.offset : hvcc.offset + hvcc.size] = new_box
+
+    # 父链逐个缩短：从包含 hvcC 的 sample entry 一路到 moov（_ancestor_chain 的
+    # path 初始值就带 moov，所以链尾是它自己）。父 box 的尺寸字段都位于 hvcC
+    # 之前，不受本次改写影响；逐个校验旧值再写新值，不符就拒写。
+    shrink = hvcc.size - len(new_box)
+    for box_node in _ancestor_chain(parsed, hvcc):
+        off = box_node.offset
+        if off < 0 or buf[off : off + 4] != box_node.size.to_bytes(4, "big"):
+            raise ValueError(f"父 box {box_node.type} 的尺寸字段与解析不符，拒绝改写")
+        buf[off : off + 4] = (box_node.size - shrink).to_bytes(4, "big")
+
+    return (
+        bytes(data[:moov_offset]) + bytes(buf) + bytes(data[moov_offset + moov_size :]),
+        dropped,
+    )
+
+
+def remove_box(data: bytes, target_type: str) -> tuple[bytes, int]:
+    """从 init 段的 moov 里删掉所有指定类型的 box，返回 (新 bytes, 删除数)。
+
+    手术法与 insert_box_after 对称：只动 moov 收尾的 init 段。删除不需要重算
+    任何偏移（fMP4 init 的 stbl 里没有指向 mdat 的 chunk offset），只把祖先链
+    的尺寸字段逐个扣减。找不到该类型时原样返回、删除数 0，调用方按需把 0 当
+    异常；父链尺寸或待删 box 的头字段与解析不符时 raise，不静默产出。
+
+    Apple 官方 P5 参考流（adv_dv_atmos）的 init 段没有 btrt / edts，ffmpeg
+    产出各带一个——“按 Apple 模板清非信令 box”的对照实验用这个函数。
+    """
+    boxes = _scan_buffer(data)
+    if not boxes or boxes[-1][0] != "moov":
+        raise ValueError("只支持 moov 收尾的 init 段；本文件的顶层 box 不是这种布局")
+    moov_offset, moov_size = boxes[-1][1], boxes[-1][2]
+    parsed = _parse_box(bytes(data[moov_offset : moov_offset + moov_size]), 0, moov_size, 1)
+    if parsed is None:
+        raise ValueError("moov 解析失败")
+
+    matches = [
+        (node, _ancestor_chain(parsed, node)) for node in parsed.find_all(target_type)
+    ]
+    if not matches:
+        return bytes(data), 0
+
+    buf = bytearray(data)
+    shrunk: dict[int, int] = {}
+    # 偏移从大到小删：先删的不动后面的 box 位置；同一祖先被多次命中时按累计
+    # 扣减记账，否则第二次校验旧尺寸必然误报。
+    for node, chain in sorted(matches, key=lambda item: item[0].offset, reverse=True):
+        start = moov_offset + node.offset
+        if buf[start : start + 4] != node.size.to_bytes(4, "big"):
+            raise ValueError(f"待删 box {target_type} 的尺寸字段与解析不符，拒绝改写")
+        if buf[start + 4 : start + 8] != target_type.encode("latin-1"):
+            raise ValueError(f"待删 box 的类型字段不是 {target_type}，拒绝改写")
+        buf[start : start + node.size] = b""
+        for ancestor in chain:
+            off = moov_offset + ancestor.offset
+            current = ancestor.size - shrunk.get(off, 0)
+            if buf[off : off + 4] != current.to_bytes(4, "big"):
+                raise ValueError(f"父 box {ancestor.type} 的尺寸字段与解析不符，拒绝改写")
+            buf[off : off + 4] = (current - node.size).to_bytes(4, "big")
+            shrunk[off] = shrunk.get(off, 0) + node.size
+    return bytes(buf), len(matches)
+
+
+def sample_entry_count(data: bytes) -> int:
+    """init 段 moov 里第一个 stsd 的 sample entry 数（Apple 官方模板 = 1）。"""
+    boxes = _scan_buffer(data)
+    if not boxes or boxes[-1][0] != "moov":
+        raise ValueError("只支持 moov 收尾的 init 段；本文件的顶层 box 不是这种布局")
+    moov_offset, moov_size = boxes[-1][1], boxes[-1][2]
+    parsed = _parse_box(bytes(data[moov_offset : moov_offset + moov_size]), 0, moov_size, 1)
+    if parsed is None:
+        raise ValueError("moov 解析失败")
+    stsd = next((b for b in parsed.find_all("stsd")), None)
+    if stsd is None:
+        raise ValueError("init 段里找不到 stsd box")
+    return len(stsd.children)
+
+
+def keep_single_sample_entry(data: bytes, keep_index: int = 0) -> tuple[bytes, int]:
+    """init 段 stsd 收敛成单个 video sample entry，返回 (新 bytes, 删除 entry 数)。
+
+    ffmpeg movenc 在流中 extradata 变化时会追加第二个 dvh1 entry：BSF 参数集
+    注入路径的产物就是 entry0 hvcC 带 VPS/SPS/PPS + 前缀 SEI(39) 数组、
+    entry1 只带 VPS/SPS/PPS。2026-09-26 真机实测：trex
+    default_sample_description_index=1、11 个分片 tfhd 全无
+    sample-description-index 覆盖——分片只引 entry0，第二个 entry 是死重。
+    Apple 官方 P5 参考流与已验证能播的 1080p 流都是单 entry，tvOS 对
+    stsd entry_count>1 的行为未验证，按能播模板收敛。
+
+    手术法同 remove_box：victim 字节整段删除、stsd entry_count 减 1、父链
+    （stsd→stbl→minf→mdia→trak→moov）尺寸字段逐个校验后扣减；字段与解析
+    不符即 raise，不静默产出。keep_index 越界、stsd 混入非 video entry 同样
+    raise。已是单 entry 时原样返回、删除数 0（幂等）。
+    """
+    boxes = _scan_buffer(data)
+    if not boxes or boxes[-1][0] != "moov":
+        raise ValueError("只支持 moov 收尾的 init 段；本文件的顶层 box 不是这种布局")
+    moov_offset, moov_size = boxes[-1][1], boxes[-1][2]
+    parsed = _parse_box(bytes(data[moov_offset : moov_offset + moov_size]), 0, moov_size, 1)
+    if parsed is None:
+        raise ValueError("moov 解析失败")
+    stsd = next((b for b in parsed.find_all("stsd")), None)
+    if stsd is None:
+        raise ValueError("init 段里找不到 stsd box")
+    entries = stsd.children
+    if len(entries) <= 1:
+        return bytes(data), 0
+    if any(entry.type not in VIDEO_SAMPLE_ENTRIES for entry in entries):
+        raise ValueError("stsd 里混入非 video sample entry，拒绝收敛")
+    if not 0 <= keep_index < len(entries):
+        raise ValueError(f"keep_index={keep_index} 越界（共 {len(entries)} 个 entry）")
+    victims = [entry for index, entry in enumerate(entries) if index != keep_index]
+
+    count_off = moov_offset + stsd.offset + 12  # header(8) + version/flags(4)
+    buf = bytearray(data)
+    old_count = int.from_bytes(buf[count_off : count_off + 4], "big")
+    if old_count != len(entries):
+        raise ValueError(
+            f"stsd entry_count={old_count} 与实际 entry 数 {len(entries)} 不符，拒绝改写"
+        )
+    buf[count_off : count_off + 4] = (old_count - len(victims)).to_bytes(4, "big")
+
+    # 同一祖先链（stsd→stbl→minf→mdia→trak→moov）会被多个 victim 命中，
+    # 按累计扣减记账，否则第二次校验原始尺寸必然误报（同 remove_box）。
+    shrunk: dict[int, int] = {}
+    for victim in sorted(victims, key=lambda item: item.offset, reverse=True):
+        start = moov_offset + victim.offset
+        if buf[start : start + 4] != victim.size.to_bytes(4, "big"):
+            raise ValueError(f"待删 sample entry {victim.type} 的尺寸字段与解析不符，拒绝改写")
+        if buf[start + 4 : start + 8] != victim.type.encode("latin-1"):
+            raise ValueError("待删 sample entry 的类型字段与解析不符，拒绝改写")
+        del buf[start : start + victim.size]
+        for ancestor in _ancestor_chain(parsed, victim):
+            off = moov_offset + ancestor.offset
+            current = ancestor.size - shrunk.get(off, 0)
+            if buf[off : off + 4] != current.to_bytes(4, "big"):
+                raise ValueError(f"父 box {ancestor.type} 的尺寸字段与解析不符，拒绝改写")
+            buf[off : off + 4] = (current - victim.size).to_bytes(4, "big")
+            shrunk[off] = shrunk.get(off, 0) + victim.size
+    return bytes(buf), len(victims)
+
+
+def atomic_write(path: Path, data: bytes) -> None:
+    """fix-up 写盘走原子替换：同目录临时文件 → fsync → os.replace。
+
+    2026-09-26 两次事故：init.mp4 被截成 0 字节（写盘中途被打断？多进程
+    同时 fix-up？原因未明）。半页初始化段不会让打包报错，只会让 AVPlayer
+    拉完 200 后静默停播——比失败更难排查。临时文件与目标同文件系统，
+    os.replace 的替换是原子的，读者只会见到旧文件或新文件。
+    """
+    tmp = path.with_name(f"{path.name}.tmp")
+    with open(tmp, "wb") as handle:
+        handle.write(bytes(data))
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(tmp, path)

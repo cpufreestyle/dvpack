@@ -18,7 +18,8 @@ DOVI_SIDEDATA = "DOVI configuration record"
 
 SHOW_ENTRIES = (
     "stream=index,codec_type,codec_name,profile,width,height,bit_depth,"
-    "color_space,color_transfer,color_primaries,avg_frame_rate,r_frame_rate,"
+    "color_range,color_space,color_transfer,color_primaries,"
+    "avg_frame_rate,r_frame_rate,"
     "stream_side_data"
     ":format=format_name,duration,size"
 )
@@ -107,6 +108,7 @@ class VideoStream:
     color_space: str
     color_primaries: str
     dovi: DoviRecord | None
+    color_range: str = ""
 
     @property
     def apple_video_range(self) -> str:
@@ -208,6 +210,7 @@ def _parse_video(stream: dict) -> VideoStream:
         color_transfer=stream.get("color_transfer") or "",
         color_space=stream.get("color_space") or "",
         color_primaries=stream.get("color_primaries") or "",
+        color_range=stream.get("color_range") or "",
         dovi=dovi,
     )
 
@@ -247,8 +250,11 @@ def ffprobe_json(source: str | Path) -> dict:
     """
     argv = [
         str(require(FFPROBE)),
+        # -v error 而不是 quiet：quiet 会把失败原因一起吞掉（stderr 全空），
+        # 2026-09-26 launchd/TCC 事故里第一次排障就盲在这里。
+        # JSON 仍走 stdout，错误走 stderr，互不污染。
         "-v",
-        "quiet",
+        "error",
         "-print_format",
         "json",
         "-show_format",
@@ -259,7 +265,13 @@ def ffprobe_json(source: str | Path) -> dict:
     ]
     proc = subprocess.run(argv, capture_output=True, text=True, encoding="utf-8")
     if proc.returncode != 0 or not proc.stdout.strip():
-        raise NotProbeable(f"ffprobe 失败（{proc.returncode}）：{source}")
+        # ffprobe 的失败原因全在 stderr（-v quiet 下尤其），丢了它现场全盲：
+        # launchd 出站被 TCC 拦成 EHOSTUNREACH 那次，就靠这行才定位到根因。
+        detail = (proc.stderr or "").strip().splitlines()
+        tail = detail[-1].strip()[:300] if detail else ""
+        raise NotProbeable(
+            f"ffprobe 失败（{proc.returncode}）：{source}" + (f" — {tail}" if tail else "")
+        )
     return json.loads(proc.stdout)
 
 

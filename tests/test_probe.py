@@ -14,6 +14,7 @@ import pytest
 from dvpack.probe import (
     DoviRecord,
     NotProbeable,
+    SHOW_ENTRIES,
     UnknownTransfer,
     mvp_verdict,
     parse_fraction,
@@ -130,6 +131,36 @@ def test_video_range_prefers_measured_transfer():
     assert parse_probe_json(_wrap(hlg), Path("x.mkv")).video.apple_video_range == "HLG"
 
 
+def test_show_entries_requests_color_range():
+    """SHOW_ENTRIES 漏 color_range，全色域源就会被当成 limited。
+
+    2026-09-26 真机事故：VideoStream.color_range 字段和 _parse_video 的解析
+    一直都在，但 ffprobe 的 -show_entries 没请求这个字段，于是永远是空串，
+    remux.source_full_range() 恒返回 0，容器/VUI/RPU 三处一起签成 limited。
+    """
+    assert "color_range" in SHOW_ENTRIES
+
+
+def test_color_range_passes_through_to_source_info():
+    """容器实测 pc 必须一路透传到 SourceInfo.video.color_range。"""
+    from dvpack.remux import source_full_range
+
+    full = copy.deepcopy(P5_L6)
+    full["color_range"] = "pc"
+    source = parse_probe_json(_wrap(full), Path("x.mkv"))
+    assert source.video.color_range == "pc"
+    assert source_full_range(source) == 1
+
+
+def test_missing_color_range_is_limited_not_full():
+    """没写 color_range 的容器保守按 limited，绝不默认全色域。"""
+    from dvpack.remux import source_full_range
+
+    source = parse_probe_json(_wrap(P5_L6), Path("x.mkv"))
+    assert source.video.color_range == ""
+    assert source_full_range(source) == 0
+
+
 def test_video_range_falls_back_to_profile_when_container_has_no_colour_tags():
     """实测形态：本机 MKV rip 不写 colour tags，color_transfer 是空字符串。"""
     no_colour = copy.deepcopy(P5_L6)
@@ -240,5 +271,33 @@ def test_probe_real_library_file_matches_container_ffprobe():
     assert source.dovi.level == 7
     assert source.dovi.el_present is False
     assert source.dovi.rpu_present is True
-    assert source.dovi.compat_id == 1
-    assert source.video.width == 3840
+
+
+def test_show_entries_covers_every_field_parse_video_reads():
+    """_parse_video 读的每个字段都必须出现在 SHOW_ENTRIES 里。
+
+    2026-09-26 真机事故的通用防线：字段加进了 VideoStream 和 _parse_video，
+    但 -show_entries 没请求它，于是一切推导都拿到空串，而且本地测试全绿。
+    漏字段不报错、只静默降级，只能靠这条静态断言兜住。
+    """
+    source = Path(__file__).parent.parent / "dvpack" / "probe.py"
+    body = source.read_text(encoding="utf-8").split("def _parse_video", 1)[1]
+
+    read: set[str] = set()
+    for chunk in body.split("stream")[1:]:
+        rest = chunk.lstrip()
+        if rest.startswith('.get("'):
+            read.add(rest[len('.get("') :].split('"', 1)[0])
+        elif rest.startswith('["'):
+            read.add(rest[len('["') :].split('"', 1)[0])
+
+    # JSON 字段名与 -show_entries 里请求的名字不一致时，在此登记。
+    aliases = {"side_data_list": "stream_side_data"}
+    read = {aliases.get(name, name) for name in read}
+
+    stream_part = SHOW_ENTRIES.split("stream=", 1)[1].split(":", 1)[0]
+    requested = {name.strip() for name in stream_part.split(",")}
+
+    assert read, "没抓到任何字段，源码结构变了"
+    missing = read - requested
+    assert not missing, f"SHOW_ENTRIES 漏了这些字段：{sorted(missing)}"

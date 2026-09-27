@@ -15,11 +15,47 @@ from pathlib import Path
 
 import pytest
 from dvpack import serve as serve_module
-from dvpack.jfpack import pack_source
+from dvpack.bmff import hvcC_param_set_types
+from dvpack.jfpack import _source_colorimetry, pack_source
+from dvpack.probe import NotProbeable, SourceInfo, VideoStream
 from dvpack.serve import ID_PATTERN, _cache_fresh, _src_fingerprint, _valid_pack_src, serve
 from dvpack.tools import FFMPEG
 
 SRC = Path(os.environ.get("DVPACK_SOURCE_MKV", ""))
+
+
+def _source_with_colour_tags(primaries, transfer, space):
+    video = VideoStream(
+        index=0,
+        codec="hevc",
+        profile="Main 10",
+        width=3840,
+        height=2160,
+        bit_depth=10,
+        frame_rate=23.976,
+        color_transfer=transfer,
+        color_space=space,
+        color_primaries=primaries,
+        dovi=None,
+    )
+    return SourceInfo(
+        path=Path("in.mkv"),
+        format_name="matroska",
+        duration=1.0,
+        size=1,
+        video=video,
+    )
+
+
+def test_source_colorimetry_falls_back_when_source_is_unflagged():
+    """DV rip 三件套为空（2026-09-26 实测）→ None，由 hls_command 落 DV 默认。"""
+    assert _source_colorimetry(_source_with_colour_tags("", "", "")) is None
+
+
+def test_source_colorimetry_keeps_declared_tags():
+    assert _source_colorimetry(
+        _source_with_colour_tags("bt2020", "smpte2084", "bt2020nc")
+    ) == ("bt2020", "smpte2084", "bt2020nc")
 
 needs_source = pytest.mark.skipif(
     not (SRC.is_file() and FFMPEG.exists()), reason="缺片源或 ffmpeg"
@@ -250,3 +286,106 @@ def test_pack_source_end_to_end(tmp_path: Path):
     assert "dvcC" in result.verification.signalling
     assert result.master.is_file()
     assert result.output.init.is_file() and result.output.segments
+
+
+def test_probe_failure_returns_502_not_dropped_connection(pack_site, monkeypatch):
+    """ffprobe 失败（launchd 出站被 TCC 拦成 EHOSTUNREACH）必须回 502。
+
+    实测教训：NotProbeable 不在 catch 面里时，异常炸穿 socket，
+    客户端拿到 http 000，serve 日志只剩半截 traceback。
+    """
+
+    def boom(*args, **kwargs):
+        raise NotProbeable("ffprobe 失败（1）：http://192.168.1.68/x — No route to host")
+
+    monkeypatch.setattr(serve_module, "pack_source", boom)
+    port, _, _ = pack_site
+    resp, _ = _get(port, f"/jf/pack?src={PRIVATE_SRC}&id=e01&seconds=5")
+    assert resp.status == 502
+
+
+def test_ffprobe_error_message_carries_stderr(monkeypatch):
+    """ffprobe 失败必须把 stderr 尾巴带进异常——只知 failed 不知为何等于没报。"""
+    import dvpack.probe as probe_module
+
+    class FakeProc:
+        returncode = 1
+        stdout = ""
+        stderr = "http://192.168.1.68/x: No route to host\n"
+
+    def fake_run(argv, **kwargs):
+        return FakeProc()
+
+    monkeypatch.setattr(probe_module.subprocess, "run", fake_run)
+    with pytest.raises(NotProbeable, match="No route to host"):
+        probe_module.ffprobe_json("http://192.168.1.68/x")
+
+
+@needs_source
+def test_pack_source_injects_param_sets_for_matroska(tmp_path: Path):
+    """Jellyfin 主场景（MKV）打包后 init 段 hvcC 必须自带参数集——真机停播根因回归。"""
+    result = pack_source(str(SRC), tmp_path / "out", seconds=6, segment_seconds=6.0)
+    types = hvcC_param_set_types(result.output.init.read_bytes())
+    assert {32, 33, 34} <= set(types), f"init 段 hvcC 参数集缺失，现有 {types}"
+
+
+@needs_source
+def test_pack_source_converges_to_single_sample_entry(tmp_path: Path) -> None:
+    """E2E：pack_source 产物 init 必须收敛为单 dvh1 entry——2026-09-26 实测
+    trex default_sample_description_index=1、11 个分片 tfhd 全无
+    sample-description-index 覆盖，只引 entry0，第二个 entry 是死重；按 Apple
+    官方参考流与已验证能播的 1080p 流（单 dvh1 entry）同一结构收敛。收敛
+    手术对已收敛的 init 必须幂等。"""
+    from dvpack.bmff import keep_single_sample_entry, sample_entry_count
+
+    result = pack_source(str(SRC), tmp_path / "out", seconds=6, segment_seconds=6.0)
+    init = result.output.init.read_bytes()
+    entries = sample_entry_count(init)
+    assert entries == 1, f"stsd 应收敛为单 entry，现有 {entries}"
+    types = hvcC_param_set_types(init)
+    assert {32, 33, 34} <= set(types), f"init 段 hvcC 参数集缺失，现有 {types}"
+    single, dropped = keep_single_sample_entry(init)
+    assert single == init and dropped == 0, "已收敛 init 再过单 entry 手术必须幂等"
+JF_SRC = os.environ.get("DVPACK_SOURCE_URL", "")
+needs_jf = pytest.mark.skipif(not JF_SRC, reason="缺 DVPACK_SOURCE_URL")
+
+
+@needs_jf
+def test_jfpack_drops_colr_and_sei_array_by_default(tmp_path: Path):
+    """Jellyfin 主链默认产出 Apple 同构信号：init 无 colr、hvcC 只有 32/33/34。
+
+    v2 臂（无 colr + 无 39 数组）2026-09-26 已在真机验证；v1（只去 colr）
+    未拿到「亮」的结论前，两臂都保留，默认走 v2。"""
+    result = pack_source(
+        JF_SRC, tmp_path / "out", seconds=6, segment_seconds=6.0
+    )
+    init = result.output.init.read_bytes()
+    from dvpack.bmff import remove_box as _remove_box
+
+    _, colr_count = _remove_box(init, "colr")
+    assert colr_count == 0, "init 段不应带 colr 盒（Apple 官方 P5 参考无 colr）"
+    types = hvcC_param_set_types(init)
+    assert 39 not in types, f"hvcC 不应带前缀 SEI(39) 数组，现有 {types}"
+    assert {32, 33, 34} <= set(types)
+    assert result.verification.ok, result.verification.problems
+
+
+@needs_jf
+def test_jfpack_can_keep_colr_control_arm(tmp_path: Path):
+    """对照臂：显式 drop_colr=False + drop_param_set_type=None 回到原样直出。"""
+    result = pack_source(
+        JF_SRC,
+        tmp_path / "control",
+        seconds=6,
+        segment_seconds=6.0,
+        drop_colr=False,
+        drop_param_set_type=None,
+    )
+    init = result.output.init.read_bytes()
+    from dvpack.bmff import remove_box as _remove_box
+
+    _, colr_count = _remove_box(init, "colr")
+    assert colr_count == 1, "对照臂应保留 colr 盒"
+    types = hvcC_param_set_types(init)
+    assert 39 in types, f"对照臂应保留 39 数组，现有 {types}"
+    assert result.verification.ok, result.verification.problems

@@ -20,13 +20,135 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
-from .bmff import parse_file
+from .bmff import hvcC_param_set_types, parse_file
 from .p5 import resign_pack
 from .probe import DoviRecord, SourceInfo, mvp_verdict, probe
 from .tools import FFPROBE, FFMPEG, require
 
 # 见模块 docstring 第 2、3 条：缺任一条都不会得到合法 DV 信令
 DV_VIDEO_FLAGS = ("-tag:v", "dvh1", "-strict", "unofficial")
+
+# init 段必须显式声明色彩信号，否则徽标点不亮。DV rip（MKV/TS）普遍不带
+# colour tag，HEVC SPS 里也没有 VUI——2026-09-26 ffprobe 实测本片源帧级
+# color_space/transfer/primaries 全为空。不补 colr 盒，AVPlayer 只能按
+# SDR BT.709 做映射：真机症状「颜色明显不对 + DV 徽标不亮」就是这么来的
+# （同源 infuse 直读文件反而点亮，差别在直读路径色彩信号由 App 侧注入）。
+# 默认三件套即 Dolby Vision Profile 5 的容器定义：BT.2020 原色 /
+# SMPTE ST 2084(PQ) 传递函数 / BT.2020 非恒定亮度矩阵。
+DV_DEFAULT_COLORIMETRY = ("bt2020", "smpte2084", "bt2020nc")
+
+
+def colorimetry_flags(
+    colorimetry: tuple[str, str, str] | None = None,
+    *,
+    full_range: int = 0,
+) -> tuple[str, ...]:
+    """让 fmp4 muxer 把 colour 信息写进 init 段 stsd 的 colr 盒（nclx 形式）。
+
+    colorimetry 为 (primaries, transfer, space)；None 时用 DV 默认三件套。
+    full_range=1（全色域源）→ `-color_range pc`；0 → tv。口径必须与源一致：
+    2026-09-26 对 Jellyfin 测试片做像素级实测（signalstats 逐帧
+    YMIN=0/YMAX=1016；limited 黑位应为 64），容器 color_range=pc、RPU
+    bl_video_full_range_flag=1——三证俱全，底层是真·全色域 10bit。旧代码
+    写死 tv，把全色域像素按 limited 解释（黑位抬升、颜色发灰），还与 RPU
+    自相矛盾，真机即「颜色明显不对 + 徽标不亮」。06:48 点亮那次是 P7 源
+    （BL 本就 limited），limited 结论不能推广到原生全色域源；Infuse 直读
+    同源 MKV 能点亮，走的就是容器/RPU 的全色域口径。
+    """
+    primaries, transfer, space = colorimetry or DV_DEFAULT_COLORIMETRY
+    return (
+        "-color_primaries",
+        primaries,
+        "-color_trc",
+        transfer,
+        "-colorspace",
+        space,
+        "-color_range",
+        "pc" if full_range else "tv",
+    )
+
+# 全色域口径从源推导，不写死：pc/full/jpeg→1，tv/limited/mpeg→0，
+# unknown/缺省→0（保守兜底——P7 Halo 转签场景 BL 本就 limited）。
+_FULL_RANGE_TOKENS = frozenset({"pc", "full", "jpeg"})
+
+
+def source_full_range(source: SourceInfo) -> int:
+    """源容器的 color_range → SPS VUI video_full_range_flag（0/1）。
+
+    容器、SPS VUI、RPU 三处口径必须一致：2026-09-26 实测本片源容器 pc、
+    RPU bl_video_full_range_flag=1、像素 YMIN=0/YMAX=1016，任何一处签错
+    （旧代码三处全签 limited）真机都是「颜色不对 + 徽标不亮」。
+    """
+    return 1 if source.video.color_range.lower() in _FULL_RANGE_TOKENS else 0
+
+
+# MKV 源的 extradata 只有 hvcC 头：Jellyfin 这条链 2026-09-26 实测 CodecPrivate
+# 23 字节（numOfArrays=0）→ `-c copy` 无参数集可抄 → init 段 hvcC 空着，
+# VPS/SPS/PPS 全走分片 in-band。Apple HLS/fMP4 要求 init 的 hvcC 自带参数集：
+# 缺了就"播了但立刻失败"（真机：拉完 init.mp4 200 + video0.m4s 200 后，
+# 00:26:05 起再无任何请求，ConnectionResetError 是电视主动断开）。
+# 补法走 libavcodec 现成的两个 BSF 模块，不重编码、不动时间戳：先把长度前缀
+# NAL 换成 Annex-B start code，再让 extract_extradata 从首分片扫出参数集写回
+# 流 extradata，muxer 随后把完整 hvcC 抄进 init 段（实测 23B → 183B）。
+# 三条死路别再走：MKV→裸 HEVC→fmp4 两步法（hvcC 对但时间戳死成
+# TARGETDURATION:0）；单独喂 extract_extradata（"No start code is found"，
+# 该模块只认 Annex-B）；多个 -bsf 参数（ffmpeg 只保留最后一个，必须逗号成链）。
+PARAM_SET_INJECTION_BSF = ("hevc_mp4toannexb", "extract_extradata")
+PARAM_SET_BSF_FORMATS = ("matroska",)
+
+# SPS VUI 的颜色/range 重写交给 ffmpeg 自带的 hevc_metadata 模块（2026-09-26
+# 实测本机 ffmpeg 8.1.2 可写 full_range 与三件套），不再手搓位翻转：
+# 颜色三件套固定 BT.2020/PQ/BT.2020nc；range 位随源走（dv_sps_vui_bsf）。
+# 源 mkv 的 SPS primaries=2/transfer=2，范围位也未必与容器一致，直通的
+# 产物真机症状「颜色明显不对 + DV 徽标不亮」。口径出处：Apple 官方 DV P5
+# 参考 init 无 colr、SPS 无 VUI 颜色，ffprobe 报 color_range=tv + master
+# VIDEO-RANGE=PQ——但那份参考本身是 limited 源，limited 只对 limited 源
+# 成立。PTL 高位（tier/non_packed）hevc_metadata 改不了，归 dvpack.dplus。
+def dv_sps_vui_bsf(full_range: int = 0) -> tuple[str, ...]:
+    """SPS VUI 信令 BSF：range 位随源，颜色三件套固定 P5 口径。"""
+    return (
+        f"hevc_metadata=video_full_range_flag={1 if full_range else 0}:"
+        "colour_primaries=9:transfer_characteristics=16:matrix_coefficients=9",
+    )
+
+
+# 兼容常量（limited 口径）：scripts/p7_to_p5.py 按 P7 源引用——P7 BL 本就
+# limited。新代码一律走 dv_sps_vui_bsf(source_full_range(source))。
+DV_SPS_VUI_BSF = dv_sps_vui_bsf()
+
+
+def param_set_injection_bsf(source: SourceInfo) -> tuple[str, ...]:
+    """源容器的 extradata 不带参数集时返回注入链，否则空链。
+
+    matroska（MKV rip，Jellyfin 主场景）需要；mp4/mov 源自带参数集，
+    不走这条，无谓改写 init 布局。
+    """
+    fmt = source.format_name.lower()
+    if any(name in fmt for name in PARAM_SET_BSF_FORMATS):
+        return PARAM_SET_INJECTION_BSF
+    return ()
+
+
+def dv_signalling_bsf(
+    source: SourceInfo, full_range: int | None = None
+) -> tuple[str, ...]:
+    """HEVC -c copy 链路的 DV 信令规范化 BSF：VUI 颜色重写成 P5 口径。
+
+    range 位随源：full_range=None 时由 source_full_range 从容器 color_range
+    推导（2026-09-26：Jellyfin 全色域源三证齐全，见 source_full_range）。
+
+    MKV 源的 extradata 只有 hvcC 头，得先把长度前缀 NAL 换 Annex-B、再把
+    （重写后的）参数集抽回 extradata，init 段 hvcC 才拿得到正确的 SPS；
+    mp4/mov 源自带参数集，直接挂 hevc_metadata 即可。
+    """
+    if full_range is None:
+        full_range = source_full_range(source)
+    vui = dv_sps_vui_bsf(full_range)
+    fmt = source.format_name.lower()
+    if any(name in fmt for name in PARAM_SET_BSF_FORMATS):
+        return ("hevc_mp4toannexb", *vui, "extract_extradata")
+    return vui
+
 
 # MVP 只要画面，音频另立里程碑：E-AC3 进 fMP4 的 HLS 兼容性还没实测，
 # 带进去会让"徽标没亮"这件事变得无法归因。
@@ -77,6 +199,9 @@ def hls_command(
     seconds: float | None = None,
     segment_seconds: float = 6.0,
     maps: tuple[str, ...] = VIDEO_ONLY_MAPS,
+    colorimetry: tuple[str, str, str] | None = None,
+    full_range: int = 0,
+    bsf: tuple[str, ...] | None = None,
 ) -> list[str]:
     argv = [str(require(FFMPEG)), "-hide_banner", "-loglevel", "error", "-y"]
     if seconds:
@@ -88,6 +213,12 @@ def hls_command(
         "-c",
         "copy",
         *DV_VIDEO_FLAGS,
+        *colorimetry_flags(colorimetry, full_range=full_range),
+    ]
+    if bsf:
+        # -bsf:v 只吃一条链：多个 -bsf 参数 ffmpeg 只保留最后一个（2026-09-26 实测）
+        argv += ["-bsf:v", ",".join(bsf)]
+    argv += [
         "-f",
         "hls",
         "-hls_segment_type",
@@ -98,6 +229,10 @@ def hls_command(
         str(segment_seconds),
         "-hls_list_size",
         "0",
+        # VOD 口径（Apple 参考流同款 #EXT-X-PLAYLIST-TYPE:VOD）：定长包
+        # 明示没有更多分片，AVPlayer 不会守着列表等追加。
+        "-hls_playlist_type",
+        "vod",
         str(playlist),
     ]
     return argv
@@ -206,7 +341,14 @@ def remux(
     # 把 cwd 钉在 out_dir 上，两种文件才会落在一起，列表里的相对 URI 也才成立。
     playlist = Path(f"{name}.m3u8")
     proc = _run(
-        hls_command(Path(src), playlist, seconds=seconds, segment_seconds=segment_seconds, maps=maps),
+        hls_command(
+            Path(src),
+            playlist,
+            seconds=seconds,
+            segment_seconds=segment_seconds,
+            maps=maps,
+            bsf=param_set_injection_bsf(source),
+        ),
         cwd=out_dir,
     )
     if not (out_dir / playlist).exists():
@@ -243,6 +385,15 @@ def verify(source: SourceInfo, output: RemuxOutput, *, target: DoviRecord | None
         elif not video.has_dvcC:
             problems.append(
                 f"配置 box 是俗名 {video.dv_box}：ffprobe 读得出，tvOS 只认规范名 dvcC"
+            )
+        # Apple HLS/fMP4 的 init 段 hvcC 必须自带 VPS/SPS/PPS。2026-09-26
+        # 真机实测：参数集只走分片 in-band 时，tvOS 拉完 init 与首分片就停播。
+        present = hvcC_param_set_types(output.init.read_bytes())
+        missing = [nal for nal in (32, 33, 34) if nal not in present]
+        if missing:
+            problems.append(
+                f"init 段 hvcC 缺参数集 {missing}（现有 {list(present)}）："
+                "Apple HLS 要求 VPS/SPS/PPS 随 init 下发，tvOS 会拉到首分片后停播"
             )
 
     try:
