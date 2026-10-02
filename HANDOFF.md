@@ -1,3 +1,32 @@
+# HANDOFF v21 (2026-10-02) — 关键修正：Infuse 的 DV 徽标与 dvcC **level** 强相关
+
+v20 说“徽标只取决于 app 的 DV 通路，与 profile 无关，收工”——对 dvplay(自研)成立，但过度泛化。
+对 Infuse，dvcC 的 dv_level 是硬门槛。
+
+## 决定性证据（逐字节比对 + 用户实测）
+- 唯一差异 1 字节：_jf/534f.../init.mp4（dvcC 01 00 0a 35 → level 6，用户实测点亮）
+  vs _jf.lvl9/init.mp4（dvcC 01 00 0a 4d → level 9，不亮）。两者分片同一批硬链接。
+- dvcC 位域（三样本互证）：payload[2] 高7位 profile；payload[3] 高5位 = dv_level，低3位 present 位。
+  0x35>>3=6(亮)、0x4d>>3=9(不亮)、0x1d>>3=3(Apple 官方)。
+- Apple 官方 adv_dv_atmos（Infuse 点亮）dvcC=01 00 0a 1d → level 3；我方 4K 点亮版是 level 6。
+- **4K P5 签 level 9 → tvOS 拒绝按 DV 源处理（徽标不亮、颜色也不对）。4K 必须 level 6。**
+
+## 根因与处置
+- 生产 jfpack.py:217-218 本身对：expected_dv_level(3840,2160)=6 → clamp 到 6；新生成 097c/17d9 init 都是 0x35 level6 ✓。
+- 事故=主 master 被误指到测试残留目录 _jf.lvl9(level9)。
+- 已修：根 _out/dv_p7_fix/master.m3u8 改指 _jf/097c.../video.m3u8（dvh1.05.06,ec-3，317段 level6+杜比音频），curl 200。
+- 验收：http://192.168.1.106:8899/master.m3u8 （Infuse；DV 音频徽标已知亮，DV 视频徽标待用户确认）。
+
+## 教训
+- 交付 4K DV 一律 level 6（1080p 用 3，对齐 Apple）。expected_dv_level 别对 2160 输出 9。
+- dvplay 自研 app 仍不亮（v20 有效，另一条线）。徽标验收只认 Infuse。lvl9 是死目录，别再指。
+
+
+
+
+> **dvplay（tvOS 客户端）侧另有交接文档**：[`../dvplay/HANDOFF.md`](../dvplay/HANDOFF.md)
+> （片库改独立页已完成；tvOS App Icon 未攻下；Jellyfin 凭据已明文暴露待轮换）。
+
 
 # HANDOFF v20 (2026-09-27 10:12) — 终局：P8 也不亮。徽标与 profile 无关，收工
 
@@ -373,3 +402,22 @@ play() 修复解决；现暴露出更深一层。
    或改用 `AVQueuePlayer` + 直接喂 item。
 5. **别再碰 DV 徽标**（结论已定，见上）。要看徽标就用 Infuse。
 
+
+# HANDOFF v22 (2026-10-02 21:10) — 「流媒体无法播放」根因：Mac 的 DHCP IP 漂移（.109 → .106），非 dvpack 故障
+
+## 现场取证（2026-10-02 21:08）
+- 用户报「流媒体无法播放」。Apple TV(192.168.1.100) ping 通；`192.168.1.109` **100% 丢包、:8899 拒连**（旧地址已死）。
+- Mac 现网：`networksetup -getinfo Wi-Fi` → **192.168.1.106**（DHCP，网关 .1）。主机名 `dvpack`，`dvpack.local` mDNS 正常通告 192.168.1.106。
+- 服务端健康：LaunchAgent `com.dvpack.serve`（PID 95228，:8899，serve `_out/dv_p7_fix`）存活；
+  master → `_jf/097c.../video.m3u8`（dvh1.05.06，dvcC `01 00 0a 35` → P5/level 6，317 段，ec-3）；
+  master/playlist/init/分片全 200，Range(206) 正常，EXTINF/TARGETDURATION 正常（非 EXTINF:0 拒播类问题）。
+- 日志佐证：电视自 20:27:04 起 **零请求**——请求根本没到达服务器，是网络层断，不是播放层拒播。
+- 旧的 8898（ffmpeg 参照流）也已死（仅 9898 无监听；8898 上只有一个 node 127.0.0.1 杂散监听）。
+
+## 处置
+- 交付地址改为：`http://192.168.1.106:8899/master.m3u8`
+- **根治 IP 漂移（第 N 次复发）**：以后一律用 mDNS 名 `http://dvpack.local:8899/master.m3u8`，或在路由器给 Mac 做 DHCP 保留。
+- 若必须让旧 .109 复活：`sudo ifconfig en0 alias 192.168.1.109 255.255.255.0`（需用户密码，重启失效）。
+
+## 教训
+- 「无法播放」先分层： curl 服务器 + ping 旧 IP + 看 serve 日志有无电视请求。零请求 = 客户端地址/网络问题，不要再查封装。
