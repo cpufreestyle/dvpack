@@ -19,7 +19,7 @@ import pytest
 from dvpack.dplus import (
     DplusSignalError,
     DplusStats,
-    _flip_bit,
+    _clear_bit,
     _hvcC_bit,
     patch_init_signalling,
     signalling_signature_ok,
@@ -62,14 +62,18 @@ def test_jf_init_signature_accepted(jf_init):
     assert signalling_signature_ok(jf_init)
 
 
-def test_jf_init_patch_sets_tier_and_non_packed(jf_init):
+def test_jf_init_patch_sets_tier_and_non_packed_cleared(jf_init):
+    """2026-10-02 点亮口径：tier / non_packed 一律清 0（与 Apple 官方 P5
+    参考流同构；实测「两位置 1」的 variant 真机不亮，见 _clear_bit 注释）。
+    """
     patched, stats = patch_init_signalling(jf_init)
     base = _hvcC_bit(jf_init, 0) // 8
-    assert patched[base + 1] == 0x22  # hvcC general_tier_flag
-    assert patched[base + 6] == 0xB0  # hvcC non_packed_constraint
-    assert len(patched) == len(jf_init)  # 只置位，不动长度
+    assert patched[base + 1] == 0x02  # hvcC general_tier_flag 清 0
+    assert patched[base + 6] == 0x90  # hvcC non_packed_constraint 清 0
+    assert len(patched) == len(jf_init)  # 只清位，不动长度
     assert stats.arrays == 3  # VPS/SPS/PPS 三个数组头补 complete 位
-    assert stats.param_sets == 6  # hvcC/VPS/SPS 各 tier+non_packed
+    assert stats.vui == 3  # hvcC/VPS/SPS 三处 VUI 按点亮口径写入
+    assert stats.param_sets == 0  # hvcC PTL 位全清 0，无置位计数
 
 
 def test_jf_init_sei_array_bytes_untouched(jf_init):
@@ -110,10 +114,14 @@ def test_unknown_array_header_still_raises(jf_init):
 
 def test_tier_guard_only_applies_to_ptl_bytes():
     # tier 位前两位是 profile_space，非零说明定位可疑，拒绝盲改
-    buf = bytearray(b"\xc0\x00")
+    # bit2=1 且 profile_space 非零（0xe0=111xxxxx → 3）才会触发卫兵；
+    # bi2 本身是 0 时 _clear_bit 先返回 False，走不到卫兵
+    buf = bytearray(b"\xe0\x00")
     with pytest.raises(DplusSignalError):
-        _flip_bit(buf, 2, "hvcC general_tier_flag", tier=True)
+        _clear_bit(buf, 2, "hvcC general_tier_flag", tier=True)
     # 卫兵只挂 tier=True 调用点：non_packed 位前两位是 progressive/
     # interlaced 源标志，源片本来就可以是 1（jfpack 产物实测 0x90）
     buf2 = bytearray(b"\x90\x00")
-    assert _flip_bit(buf2, 8, "non packed") is True
+    assert _clear_bit(buf2, 0, "non packed") is True
+    # 清位语义：清完再清是 no-op，返回 False
+    assert _clear_bit(buf2, 0, "non packed") is False

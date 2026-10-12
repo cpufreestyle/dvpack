@@ -6,7 +6,13 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from .bmff import atomic_write
-from .remux import FFMPEG, RemuxOutput, _run, require
+from .remux import (
+    DV_LEAVE_COLORIMETRY_UNSPECIFIED,
+    FFMPEG,
+    RemuxOutput,
+    _run,
+    require,
+)
 
 NAL_TYPE_VPS = 32
 NAL_TYPE_SPS = 33
@@ -69,47 +75,51 @@ def _nal_type(data, nal_start: int) -> int:
     return ((data[nal_start] << 8) | data[nal_start + 1]) >> 9 & 0x3F
 
 
-def _flip_bit(
+def _clear_bit(
     data: bytearray, bit: int, what: str, *, tier: bool = False
 ) -> bool:
-    """EBSP 裸字节置位（hvcC 的 PTL byte，不涉 00 00 03 转义）。
+    """EBSP 裸字节清位（hvcC 的 PTL byte，不涉 00 00 03 转义）。
 
-    tier=True 时该 byte 前两位是 profile_space，非零说明定位可疑，拒绝
-    盲改；non_packed 位（constraint byte）前两位是 progressive/interlaced
-    源标志，源片本来就可以是 1（实测本片源 0x90），与 PTL 对齐无关，
-    不能拿来当对齐哨兵——旧版拿它当哨兵，jfpack 产物直接被误拒。
+    2026-10-02 由置位改清位：两个点亮版 init/分片实测 tier=0、non_packed=0
+    （与 Apple 官方 P5 参考流同构），把两位置 1 的那一臂（variant D）用户
+    实测「D 没亮」，本模块归一到点亮口径。tier=True 时该 byte 前两位是
+    profile_space，非零说明定位可疑，拒绝盲改；non_packed 位（constraint
+    byte）前两位是 progressive/interlaced 源标志，源片本来就可以是 1
+    （实测本片源 0x90），与 PTL 对齐无关，不能拿来当对齐哨兵——旧版拿它
+    当哨兵，jfpack 产物直接被误拒。
     """
     byte, off = divmod(bit, 8)
     cur = data[byte]
-    if (cur >> (7 - off)) & 1:
+    if not (cur >> (7 - off)) & 1:
         return False
     if tier and cur >> 6:
         raise DplusSignalError(
             f"{what}：profile_space 非零，bit 定位可疑，拒绝盲改"
         )
-    data[byte] = cur | (0x80 >> off)
+    data[byte] = cur & ~(0x80 >> off) & 0xFF
     return True
 
 
-def _set_ptl_flag(rbsp: bytearray, bit: int, *, tier: bool = False) -> bool:
-    """RBSP 空间内置 PTL 标志位；已置位跳过。
+def _clear_ptl_flag(rbsp: bytearray, bit: int, *, tier: bool = False) -> bool:
+    """RBSP 空间内清 PTL 标志位；已是 0 就跳过。
 
-    tier 位前两位是 profile_space，非零拒绝盲改（对齐哨兵）；non_packed
-    前两位是 progressive/interlaced 源标志，源片为 1 也正常，不当哨兵，
-    对齐由先跑的 tier 哨兵背书。
+    口径同 _clear_bit：2026-10-02 起归一到 tier=0 / non_packed=0 的点亮
+    口径。tier 位前两位是 profile_space，非零拒绝盲改（对齐哨兵）；
+    non_packed 前两位是 progressive/interlaced 源标志，源片为 1 也正常，
+    不当哨兵，对齐由先跑的 tier 哨兵背书。
     """
-    if _read_bits(rbsp, bit, 1):
+    if not _read_bits(rbsp, bit, 1):
         return False
     if tier and _read_bits(rbsp, bit - 2, 2):
         raise DplusSignalError("profile_space 非零，bit 定位可疑，拒绝盲改")
-    _write_bits(rbsp, bit, 1, 1)
+    _write_bits(rbsp, bit, 1, 0)
     return True
 
 
 def _patch_param_set(
     data: bytearray, nal_start: int, nal_end: int, stats: DplusStats
 ) -> None:
-    """VPS/SPS 的 tier / non_packed 约束位置 1。
+    """VPS/SPS 的 tier / non_packed 约束位清 0。
 
    必须走 EBSP->RBSP：本片源 SPS 的 non_packed 位位于 00 00 03 转义字节之后，
    直接在 EBSP 上数字节会写到转义字节本身，把码流写坏。
@@ -124,11 +134,11 @@ def _patch_param_set(
         return
     header = _SPS_PTL_BIT if nal_type == NAL_TYPE_SPS else _VPS_PTL_BIT
     changed = 0
-    if _set_ptl_flag(
+    if _clear_ptl_flag(
         rbsp, _NAL_HEADER_BITS + header + _PTL_TIER_BIT, tier=True
     ):
         changed += 1
-    if _set_ptl_flag(rbsp, _NAL_HEADER_BITS + header + _PTL_NON_PACKED_BIT):
+    if _clear_ptl_flag(rbsp, _NAL_HEADER_BITS + header + _PTL_NON_PACKED_BIT):
         changed += 1
     if not changed:
         return
@@ -198,9 +208,24 @@ def _patch_sps_vui(
 
     full_range 由调用方从源推导（remux.source_full_range）：容器、SPS VUI、
     RPU 三处口径必须一致。None = 只动颜色三件套，range 保持原值。
+
+    2026-09-27 真机 A/B 实证推翻「照 Apple 参考留白」的结论：
+      · 点亮  _jf/534f.old.signalled → SPS VUI 016a 12 20 12（显式 PQ）
+      · 不亮  _jf/localtest001      → SPS VUI 016a 04 04 04（unspecified）
+    ffprobe 侧同证：tv + bt2020nc/smpte2084/bt2020 对比 tv + 全 unknown。
+    所以这里必须显式写三件套，range 位按 full_range 对齐源口径。
     """
+    # 2026-09-27 真机 A/B 实证：显式 BT.2020/PQ 是点火条件，不是阻碍。
+    #  点亮（_jf/534f.old.signalled）SPS VUI = 016a 12 20 12 → colour_description
+    #  不亮（_jf/localtest001）        SPS VUI = 016a 04 04 04 → unspecified
+    # ffprobe 侧同样：tv + bt2020nc/smpte2084/bt2020 对比 tv + 全 unknown。
+    # 之前照 Apple 参考「留白」的假设被证伪，已回退。
+    # 位偏移只对本片源 SPS 结构成立（实测校准），长度不匹配就整体跳过，
+    # 宁可留原值也不改错字节。
     nal = bytes(data[nal_start:nal_end])
     rbsp, idx = _ebsp_to_rbsp(nal)
+    if _VUI_FULL_RANGE_BIT >= len(rbsp) * 8 - 1:
+        return
     changed = 0
     if full_range is not None and _read_bits(rbsp, _VUI_FULL_RANGE_BIT, 1) != full_range:
         _write_bits(rbsp, _VUI_FULL_RANGE_BIT, 1, full_range)
@@ -260,11 +285,11 @@ def patch_init_signalling(
     base = _hvcC_bit(buf, 0) // 8
     if buf[base] != 1:
         raise DplusSignalError("hvcC configurationVersion != 1，定位可疑")
-    if _flip_bit(
+    if _clear_bit(
         buf, base * 8 + 8 + _PTL_TIER_BIT, "hvcC general_tier_flag", tier=True
     ):
         stats.param_sets += 1
-    if _flip_bit(
+    if _clear_bit(
         buf,
         base * 8 + 8 + _PTL_NON_PACKED_BIT,
         "hvcC general_non_packed_constraint_flag",
@@ -360,15 +385,18 @@ def expected_signalling(full_range: int = 0) -> tuple[tuple[str, int], ...]:
     2026-09-26 像素级实测：Jellyfin 测试片 YMIN=0/YMAX=1016 + 容器 pc +
     RPU bl_video_full_range_flag=1，是全色域源，三处必须一致地签全色域；
     06:48 点亮那次是 P7 源（BL 本就 limited），limited 不是永远正确的口径。
-    颜色三件套与 tier/non_packed 与源范围无关，恒为 9/16/9 + 1/1。
+    颜色三件套与 tier/non_packed 与源范围无关，恒为 9/16/9；tier/non_packed
+    恒为 0/0——2026-10-02 逐 box 对照：两个点亮版 init（live-A 1056B、Sept 27
+    VUI 臂）都是 tier=0/non_packed=0，而把两位置 1 的 variant D 用户实测
+    「D 没亮」。签 1/1 是被证伪的假设残留下来的默认值。
     """
     return (
         ("video_full_range_flag", 1 if full_range else 0),
         ("colour_primaries", 9),
         ("transfer_characteristics", 16),
         ("matrix_coefficients", 9),
-        ("general_tier_flag", 1),
-        ("general_non_packed_constraint_flag", 1),
+        ("general_tier_flag", 0),
+        ("general_non_packed_constraint_flag", 0),
     )
 
 

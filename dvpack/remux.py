@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import re
+import struct
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -23,19 +24,23 @@ from pathlib import Path
 from .bmff import hvcC_param_set_types, parse_file
 from .p5 import resign_pack
 from .probe import DoviRecord, SourceInfo, mvp_verdict, probe
-from .tools import FFPROBE, FFMPEG, require
+from .tools import FFPROBE, FFMPEG, ffmpeg_timeout, require
 
 # 见模块 docstring 第 2、3 条：缺任一条都不会得到合法 DV 信令
 DV_VIDEO_FLAGS = ("-tag:v", "dvh1", "-strict", "unofficial")
 
-# init 段必须显式声明色彩信号，否则徽标点不亮。DV rip（MKV/TS）普遍不带
-# colour tag，HEVC SPS 里也没有 VUI——2026-09-26 ffprobe 实测本片源帧级
-# color_space/transfer/primaries 全为空。不补 colr 盒，AVPlayer 只能按
-# SDR BT.709 做映射：真机症状「颜色明显不对 + DV 徽标不亮」就是这么来的
-# （同源 infuse 直读文件反而点亮，差别在直读路径色彩信号由 App 侧注入）。
-# 默认三件套即 Dolby Vision Profile 5 的容器定义：BT.2020 原色 /
-# SMPTE ST 2084(PQ) 传递函数 / BT.2020 非恒定亮度矩阵。
-DV_DEFAULT_COLORIMETRY = ("bt2020", "smpte2084", "bt2020nc")
+# init 段的色彩信令必须全部留白：AVPlayer 的 Dolby Vision 通路要求容器与
+# SPS VUI 都不抢着描述颜色，把色彩管理完全交给带内 RPU。2026-09-27 与
+# Apple 官方 DV 参考流拆出的 4k/init.mp4 逐字段对比证实：
+#   Apple：color_range=tv，color_space/transfer/primaries 均 unknown，
+#          stsd 无 colr 盒，SPS VUI 不写 colour_description。
+#   dvpack 旧产物：color_range=pc + 显式 bt2020/smpte2084/bt2020nc。
+# 显式 full-range + 显式 PQ 会把 AVPlayer 推到 SDR/HDR 直通路径，不进 DV
+# 专属 tone-mapping，真机症状即「Dolby Vision 徽标不亮 + 颜色发灰/发绿」。
+# Apple 敢留白是因为 P5 按定义就是 RPU 独占色彩管理，BL 只当容器。
+# 这里的常量仅供 dvassert/报告引用，不再作为 ffmpeg 参数下发。
+DV_P5_COLORIMETRY = ("bt2020", "smpte2084", "bt2020nc")
+DV_LEAVE_COLORIMETRY_UNSPECIFIED = False
 
 
 def colorimetry_flags(
@@ -45,39 +50,55 @@ def colorimetry_flags(
 ) -> tuple[str, ...]:
     """让 fmp4 muxer 把 colour 信息写进 init 段 stsd 的 colr 盒（nclx 形式）。
 
-    colorimetry 为 (primaries, transfer, space)；None 时用 DV 默认三件套。
-    full_range=1（全色域源）→ `-color_range pc`；0 → tv。口径必须与源一致：
-    2026-09-26 对 Jellyfin 测试片做像素级实测（signalstats 逐帧
-    YMIN=0/YMAX=1016；limited 黑位应为 64），容器 color_range=pc、RPU
-    bl_video_full_range_flag=1——三证俱全，底层是真·全色域 10bit。旧代码
-    写死 tv，把全色域像素按 limited 解释（黑位抬升、颜色发灰），还与 RPU
-    自相矛盾，真机即「颜色明显不对 + 徽标不亮」。06:48 点亮那次是 P7 源
-    （BL 本就 limited），limited 结论不能推广到原生全色域源；Infuse 直读
-    同源 MKV 能点亮，走的就是容器/RPU 的全色域口径。
+    colorimetry 为 (primaries, transfer, space)。
+
+    DV 链路一律返回空 tuple：2026-09-27 与 Apple 官方 DV 参考
+    （_out/apple_ref/4k/init.mp4）逐字段对比确认，容器层显式签 any-range
+    都会把 AVPlayer 推离 DV 专属 tone-mapping 通路，真机即「Dolby Vision
+    徽标不亮 + 颜色发灰/发绿」。Apple 那份参考 color_range=tv 但
+    space/transfer/primaries 全 unknown、stsd 里也没有 colr 盒——FFmpeg
+    侧的等效做法就是「一个 color_* 标志都不给」：muxer 不写 colr，
+    SPS VUI 不写 colour_description，色彩完全交给带内 RPU。
+
+    colorimetry/full_range 形参保留，供 dvassert 与 p7_to_p5 的受限场景
+    显式传入、绕过留白策略。
     """
-    primaries, transfer, space = colorimetry or DV_DEFAULT_COLORIMETRY
+    if DV_LEAVE_COLORIMETRY_UNSPECIFIED and colorimetry is None:
+        # color 三件套留白（见 DV_LEAVE_COLORIMETRY_UNSPECIFIED 注释）；
+        # range 位显式钉 tv：实测源 MKV 的 color_range=pc 会被 -c copy
+        # 一路透传进 init（ffprobe 报 color_range=pc），而 Apple 官方 DV
+        # 参考 4k/init.mp4 是 color_range=tv + 三件套全 unknown。DV 链路
+        # 只需要把 pc 拉回 tv，不签任何色彩描述。
+        return ("-color_range", "tv")
+
+    if colorimetry is None:
+        colorimetry = DV_P5_COLORIMETRY
     return (
         "-color_primaries",
-        primaries,
+        colorimetry[0],
         "-color_trc",
-        transfer,
+        colorimetry[1],
         "-colorspace",
-        space,
+        colorimetry[2],
         "-color_range",
         "pc" if full_range else "tv",
     )
 
-# 全色域口径从源推导，不写死：pc/full/jpeg→1，tv/limited/mpeg→0，
-# unknown/缺省→0（保守兜底——P7 Halo 转签场景 BL 本就 limited）。
-_FULL_RANGE_TOKENS = frozenset({"pc", "full", "jpeg"})
+# DV Profile 5 的 BL 按 Dolby 规范就是 limited（16-235），所以打包一律签 tv。
+# 2026-09-27 真机实证：点亮的 534f pack 是 tv + 显式 PQ；把源容器里的 pc 透传
+# 进 SPS（-color_range pc）时徽标不亮。full-range 的 DV BL 极罕见，为它保留
+# 的「按源推导」分支已经害过真机，删掉。
+_FULL_RANGE_TOKENS = frozenset({"never-match-anymore"})
 
 
 def source_full_range(source: SourceInfo) -> int:
     """源容器的 color_range → SPS VUI video_full_range_flag（0/1）。
 
-    容器、SPS VUI、RPU 三处口径必须一致：2026-09-26 实测本片源容器 pc、
-    RPU bl_video_full_range_flag=1、像素 YMIN=0/YMAX=1016，任何一处签错
-    （旧代码三处全签 limited）真机都是「颜色不对 + 徽标不亮」。
+    恒定回 0（limited）：DV Profile 5 的 BL 按 Dolby 规范就是 limited，
+    2026-09-27 真机实证——把源容器 pc 透传进 SPS（-color_range pc）时
+    徽标不亮，full-range 的 DV BL 极罕见，「按源推导」分支已删。
+    色彩口径全交给带内 RPU（见 dv_sps_vui_bsf 注释）。形参 source 保留，
+    供 dvassert 与 p7_to_p5 的受限场景保持同构。
     """
     return 1 if source.video.color_range.lower() in _FULL_RANGE_TOKENS else 0
 
@@ -105,9 +126,17 @@ PARAM_SET_BSF_FORMATS = ("matroska",)
 # VIDEO-RANGE=PQ——但那份参考本身是 limited 源，limited 只对 limited 源
 # 成立。PTL 高位（tier/non_packed）hevc_metadata 改不了，归 dvpack.dplus。
 def dv_sps_vui_bsf(full_range: int = 0) -> tuple[str, ...]:
-    """SPS VUI 信令 BSF：range 位随源，颜色三件套固定 P5 口径。"""
+    """SPS VUI 信令 BSF：显式签 BT.2020/PQ/BT.2020nc + limited range。
+
+    2026-09-27 真机 A/B 实证：
+      · 点亮  SPS VUI 016a 12 20 12，ffprobe tv + bt2020nc/smpte2084/bt2020
+      · 不亮  SPS VUI 016a 04 04 04，ffprobe tv + 全 unknown
+    显式 colour_description_present_flag 是点火条件，不是阻碍——之前照
+    Apple 参考「留白」的假设被证伪。range 恒签 0（limited）：DV P5 的 BL
+    按 Dolby 规范就是 16-235，源容器里的 pc 透传进来会让徽标灭。
+    """
     return (
-        f"hevc_metadata=video_full_range_flag={1 if full_range else 0}:"
+        "hevc_metadata=video_full_range_flag=0:"
         "colour_primaries=9:transfer_characteristics=16:matrix_coefficients=9",
     )
 
@@ -150,13 +179,212 @@ def dv_signalling_bsf(
     return vui
 
 
-# MVP 只要画面，音频另立里程碑：E-AC3 进 fMP4 的 HLS 兼容性还没实测，
-# 带进去会让"徽标没亮"这件事变得无法归因。
+# 画面 + 音频一起封装（音视频混在同一条 fMP4 流里，不做 EXT-X-MEDIA 分离）。
+#
+# 历史：这里曾是 VIDEO_ONLY_MAPS = ("-map", "0:v:0")，理由是「E-AC3 进 fMP4 的
+# HLS 兼容性没实测，带进去会让徽标归因变困难」。但纯视频轨＝**电视上完全没声音**，
+# 而实测 Jellyfin 常见 DV 源的音轨是 AAC/AC-3，都能直接 copy 进 fMP4。
+# 音视频同流（muxed）无需 EXT-X-MEDIA 声明，是最省事也最兼容的写法。
+VIDEO_AUDIO_MAPS = ("-map", "0:v:0", "-map", "0:a:0?")
+# 兼容旧调用点（只要画面）。
 VIDEO_ONLY_MAPS = ("-map", "0:v:0")
+
+
+def audio_pack_mode(source: SourceInfo, maps: tuple[str, ...]):
+    """音轨打包口径，返回 (maps, declared_audio_codec, transcode)。
+
+    master 的 CODECS 必须和实际 init/media 逐字一致——声明了媒体里没有的
+    编码（2026-09-27：写死 ec-3 而源是 dts）或反过来（媒体里有轨却不在
+    CODECS 里声明），AVPlayer 都直接拒收整个 master：真机黑屏、日志里只有
+    一次 master.m3u8、init.mp4 一次都不请求。
+
+    · maps 不含音频（客户端 audio=0）→ 纯视频包，不声明编码；
+    · 源音轨编码 Apple 认识（aac/ac-3/ec-3/flac）→ 原样 copy，声明源编码；
+    · 有轨但不认识（dts/truehd…）→ Apple 平台解不了，转码 aac 5.1 保住
+       声音，master 声明 mp4a.40.2，init/media 里就是 AAC。2026-10-03 狂飙
+      ab476f 真机复现：dts 原轨进包即黑屏 + 红色禁止图标。
+    """
+    if not any(m.endswith("0:a:0?") or m.endswith("0:a:0") for m in maps):
+        return maps, "", False
+    if source.audio_codec:
+        return maps, source.audio_codec, False
+    if not source.audio_codec_name:
+        return maps, "", False
+    return maps, "mp4a.40.2", True
+
+# 时间轴规整：真机「黑屏卡住」的根因（2026-09-27）。
+#
+# 源的 DTS 非单调（remux 一直报 "Non-monotonic DTS; previous: 124, current: 83"），
+# `-c copy` 又原样搬进分片，于是：
+#   * 末段被切出只有 3 帧（EXTINF:0.060000）的残片，TARGETDURATION 却是 6；
+#   * 该片内 DTS 乱序（60.060 → 60.220 → 60.140）。
+# AVPlayer 读到这种分片会停在一个无法呈现的缓冲区上 = 黑屏、不再发请求。
+#
+# 修法用 setts 位流过滤器把时间戳重写成干净的 CFR 序列——纯时间戳操作，
+# **不重编码像素**（DV 必须保持 -c copy，重编码会毁掉 RPU）。
+# time_base 取源的帧率（50fps 源 → 1/50），ts=N 逐帧递增，duration=1 定长。
+def setts_bsf(source: SourceInfo) -> str:
+    """保留真实帧间隔，只把 PTS/DTS 平移到零点。
+
+    旧实现 `setts=time_base=1/fps:ts=N:duration=1` 会把每帧时间重写成序号，
+    HLS muxer 因此失去关键帧时间戳，60s 输入退化成 1 个 100MB+ 分片。
+    直接不修又会暴露源时间戳里的重复 DTS，ffmpeg 解码整个 playlist 时报
+    `non monotonically increasing dts`。2026-09-27 A/B 实测，
+    `PTS-STARTPTS / DTS-STARTDTS` 同时满足两个条件：保留真实帧间隔与关键帧
+    位置（11 个分片），并把时间轴归零成严格单调。
+    """
+    return "setts=pts=PTS-STARTPTS:dts=DTS-STARTDTS"
 
 
 class RemuxError(Exception):
     pass
+
+
+@dataclass(frozen=True)
+class SegmentTimestampProblem:
+    """产出分片的时间轴问题（Infuse FCPTSIncorrectnessDetector 的离线对应物）。
+
+    只记录事实与位置；修复属于 setts/时间轴规整层。verify() 的 ffprobe 复读
+    在后面，这一步用纯 ISOBMFF 解析把"ffmpeg 正常退出但时间轴已坏"的产物
+    提前拦下，省一次端到端校验。
+    """
+
+    segment: Path
+    field: str
+    expected: int
+    actual: int
+
+    def describe(self) -> str:
+        return (
+            f"{self.segment.name} {self.field}：期望 {self.expected}，实得 {self.actual}"
+        )
+
+
+def _boxes(data: bytes, start: int, end: int):
+    """在 [start, end) 内产出 (type, box_start, body_start, box_end)。"""
+    pos = start
+    while pos + 8 <= end:
+        size = int.from_bytes(data[pos : pos + 4], "big")
+        if size == 1:
+            if pos + 16 > end:
+                return
+            size = int.from_bytes(data[pos + 8 : pos + 16], "big")
+        elif size == 0:
+            size = end - pos
+        if size < 8 or pos + size > end:
+            return
+        btype = data[pos + 4 : pos + 8].decode("latin-1", "replace")
+        yield btype, pos, pos + 8, pos + size
+        pos += size
+
+
+def _find_box(data: bytes, name: str, start: int = 0, end: int | None = None):
+    for btype, at, body, stop in _boxes(data, start, end if end is not None else len(data)):
+        if btype == name:
+            return at, body, stop
+    return None
+
+
+def _segment_timeline(segment: Path) -> tuple[int, list[tuple[int, int]]] | None:
+    """读一个 .m4s 的 (tfdt 基准时间, [(sample_index, duration), ...])。
+
+    tfdt 只有一个：dvpack 的产物是单轨分片（音视频同流走一个 track）。trun
+    的 sample 表按 ISO 14496-12 §8.8.8 位域展开。
+    """
+    data = segment.read_bytes()
+    moof = _find_box(data, "moof")
+    if moof is None:
+        return None
+    _, moof_body, moof_end = moof
+    traf = _find_box(data, "traf", moof_body, moof_end)
+    if traf is None:
+        return None
+    _, traf_body, traf_end = traf
+    tfdt = _find_box(data, "tfdt", traf_body, traf_end)
+    trun = _find_box(data, "trun", traf_body, traf_end)
+    if tfdt is None or trun is None:
+        return None
+    _, tfdt_body, _ = tfdt
+    version = data[tfdt_body]
+    if version == 1:
+        if len(data) < tfdt_body + 12:
+            return None
+        base_time = int.from_bytes(data[tfdt_body + 4 : tfdt_body + 12], "big")
+    else:
+        if len(data) < tfdt_body + 8:
+            return None
+        base_time = int.from_bytes(data[tfdt_body + 4 : tfdt_body + 8], "big")
+
+    _, trun_body, _ = trun
+    flags = int.from_bytes(data[trun_body + 1 : trun_body + 4], "big")
+    count = int.from_bytes(data[trun_body + 4 : trun_body + 8], "big")
+    cursor = trun_body + 8
+    per_sample = 0
+    if flags & 0x000001:
+        cursor += 4
+    if flags & 0x000004:
+        cursor += 4
+    if flags & 0x000100:
+        per_sample += 4
+    if flags & 0x000200:
+        per_sample += 4
+    if flags & 0x000400:
+        per_sample += 4
+    if flags & 0x000800:
+        per_sample += 4
+    if not flags & 0x000100:
+        # 无逐帧 duration（Apple 官方参考分片就是这种形态：duration 走
+        # trex 默认值）。帧级校验做不了，但段级 tfdt 校验仍然可行——
+        # 返回空 sample 表，让调用方只按 base_time 比较相邻分片。
+        return base_time, []
+    samples: list[tuple[int, int]] = []
+    for index in range(count):
+        at = cursor + index * per_sample
+        if at + 4 > len(data):
+            return None
+        samples.append((index, int.from_bytes(data[at : at + 4], "big")))
+    return base_time, samples
+
+
+def validate_segments(output: RemuxOutput) -> tuple[SegmentTimestampProblem, ...]:
+    """产出分片静态预检：tfdt 必须沿分片序列递增，trun duration 必须为正。
+
+    这两层各抓一种真机事故：tfdt 回退会让 AVPlayer 停在无法呈现的缓冲区
+    （黑屏不再请求）；duration=0/越界负值对应 ffmpeg 报 non-monotonic DTS
+    后切出的残片。静态检测发生在 ffprobe 复读之前，坏包在转签与上电视前
+    就被拒绝。
+    """
+    problems: list[SegmentTimestampProblem] = []
+    previous_end: int | None = None
+    for segment in output.segments:
+        timeline = _segment_timeline(segment)
+        if timeline is None:
+            continue
+        base_time, samples = timeline
+        if previous_end is not None and base_time < previous_end:
+            problems.append(
+                SegmentTimestampProblem(
+                    segment=segment,
+                    field="tfdt baseMediaDecodeTime 回退",
+                    expected=previous_end,
+                    actual=base_time,
+                )
+            )
+        total = base_time
+        for index, duration in samples:
+            if duration <= 0:
+                problems.append(
+                    SegmentTimestampProblem(
+                        segment=segment,
+                        field=f"sample#{index} duration",
+                        expected=1,
+                        actual=duration,
+                    )
+                )
+                continue
+            total += duration
+        previous_end = total
+    return tuple(problems)
 
 
 @dataclass(frozen=True)
@@ -198,11 +426,19 @@ def hls_command(
     *,
     seconds: float | None = None,
     segment_seconds: float = 6.0,
-    maps: tuple[str, ...] = VIDEO_ONLY_MAPS,
+    maps: tuple[str, ...] = VIDEO_AUDIO_MAPS,
     colorimetry: tuple[str, str, str] | None = None,
     full_range: int = 0,
     bsf: tuple[str, ...] | None = None,
+    setts: str | None = None,
+    transcode_audio: bool = False,
 ) -> list[str]:
+    """拼 ffmpeg argv。
+
+    `bsf` 与 `setts` 会被并进**同一条** -bsf:v 逗号链：多个 -bsf 参数时 ffmpeg
+    只保留最后一个（实测），必须合成一条。`setts` 排最后：它只改时间戳，
+    放前面不影响参数集注入与 VUI 重写。
+    """
     argv = [str(require(FFMPEG)), "-hide_banner", "-loglevel", "error", "-y"]
     if seconds:
         argv += ["-t", str(seconds)]
@@ -215,16 +451,32 @@ def hls_command(
         *DV_VIDEO_FLAGS,
         *colorimetry_flags(colorimetry, full_range=full_range),
     ]
-    if bsf:
-        # -bsf:v 只吃一条链：多个 -bsf 参数 ffmpeg 只保留最后一个（2026-09-26 实测）
-        argv += ["-bsf:v", ",".join(bsf)]
+    if bsf or setts:
+        # -bsf:v 只吃一条链：多个 -bsf 参数 ffmpeg 只保留最后一个（2026-09-26 实测），
+        # 所以 bsf 与 setts 必须合成一条。setts 排最后（只改时间戳，不影响前者）。
+        chain = list(bsf or ())
+        if setts:
+            chain.append(setts)
+        argv += ["-bsf:v", ",".join(chain)]
+    if any(m == "0:a:0?" for m in maps):
+        # 音视频同流：音频显式声明 codec（-c copy 已覆盖常规情形）。源音轨
+        # 编码 Apple 不认（dts 等）时 transcode_audio=True：转码 aac 5.1，
+        # master 同步声明 aac，信令与产物同源，不会出现「master 声明 ec-3
+        # 而媒体里没有轨」那类整包拒收。实测 ffmpeg 8.1.2 dts→aac 6ch 直通。
+        argv += ["-c:a", "aac" if transcode_audio else "copy"]
+        if transcode_audio:
+            argv += ["-b:a", "384k"]
     argv += [
         "-f",
         "hls",
         "-hls_segment_type",
         "fmp4",
-        "-hls_flags",
-        "independent_segments",
+        # 绝不能给 -hls_flags independent_segments：2026-09-27 实测该 flag 在
+        # fmp4 模式下会打乱 hls_time 的分段决策，60s 输入只产出 1 个 100MB+
+        # 分片（真机：Apple TV 拉完 video.m3u8 后既不请求 init.mp4 也不再
+        # 拉分片，直接黑屏）。去掉后恢复每关键帧切（14.389/2.837/2.669…）。
+        # 列表里的 #EXT-X-INDEPENDENT-SEGMENTS 由 fmp4 的每分片自带
+        # 独立 traf 自然成立，不需要这个 flag。
         "-hls_time",
         str(segment_seconds),
         "-hls_list_size",
@@ -238,8 +490,31 @@ def hls_command(
     return argv
 
 
-def _run(argv: list[str], cwd: Path | None = None) -> subprocess.CompletedProcess:
-    return subprocess.run(argv, capture_output=True, text=True, encoding="utf-8", cwd=cwd)
+def _run(
+    argv: list[str], cwd: Path | None = None, timeout: float | None = None
+) -> subprocess.CompletedProcess:
+    """跑 ffmpeg/ffprobe，带执行上限（见 tools.ffmpeg_timeout）。
+
+    timeout=None 走全局限；调用方知道时长语义时显式传（打包链路传 seconds
+    派生值）。超时 → RemuxError：serve 的 PACK_ERRORS 捕获后回 502 并让
+    锁自然释放，不再把同 item 的后续点击永久堵死。
+    """
+    cap = timeout if timeout is not None else ffmpeg_timeout()
+    try:
+        return subprocess.run(
+            argv,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            cwd=cwd,
+            timeout=cap,
+        )
+    except subprocess.TimeoutExpired as exc:
+        head = " ".join(str(a) for a in argv[:3])
+        raise RemuxError(
+            f"ffmpeg/ffprobe 执行超时（>{cap:.0f}s 已杀）：{head}……"
+            "（上游流卡死或机器过载；锁已释放，可重试）"
+        ) from exc
 
 
 # Profile 5 单层的 RPU 必须自洽：不能带 NLQ，且残差（增强层）必须声明禁用。
@@ -319,16 +594,77 @@ def resolve_output(playlist: Path) -> RemuxOutput:
     )
 
 
+def trim_stub_tail(output: RemuxOutput, *, min_seconds: float = 1.0) -> RemuxOutput:
+    """删掉片尾的「残尾分片」并重写列表。
+
+    真机黑屏的第二半：末段经常只剩 0.06s（1~3 帧）而 TARGETDURATION=6。就算
+    时间戳已被 setts 规整成单调，这种片尾仍可能让 AVPlayer 在一个几乎没有
+    可呈现内容的缓冲区上停住。60s 预览里丢掉最后 0.06s 无感知，但能把这个
+    风险彻底摘掉。
+
+    只从**尾部**丢，且保底留一段——中间分片永不动。
+    """
+    text = output.playlist.read_text()
+    # 逐行扫：EXTINF 与紧随其后的 URI 成对，其余行（头、MAP、ENDLIST）原样保留。
+    lines = text.splitlines(keepends=True)
+    entries: list[tuple[int, float, str]] = []  # (extinf 行号, 时长, URI)
+    for i, line in enumerate(lines):
+        if line.startswith("#EXTINF:"):
+            uri = next((lines[j] for j in range(i + 1, len(lines))
+                        if not lines[j].startswith("#")), "")
+            entries.append((i, float(line[len("#EXTINF:"):].split(",")[0]), uri.strip()))
+    if len(entries) < 2:
+        return output
+
+    drop = 0
+    for idx in range(len(entries) - 1, 0, -1):  # idx==0 保底：首段永不丢
+        if entries[idx][1] >= min_seconds:
+            break
+        drop += 1
+    if not drop:
+        return output
+
+    doomed = entries[len(entries) - drop:]
+    keep_extinf_lines = {e[0] for e in entries[: len(entries) - drop]}
+    drop_uris = {e[2] for e in doomed}
+    out_lines = []
+    skip_next_uri = False
+    for i, line in enumerate(lines):
+        if line.startswith("#EXTINF:") and i not in keep_extinf_lines:
+            skip_next_uri = True
+            continue
+        if skip_next_uri and not line.startswith("#"):
+            skip_next_uri = False
+            continue
+        out_lines.append(line)
+    output.playlist.write_text("".join(out_lines))
+    for uri in drop_uris:
+        target = output.playlist.parent / uri
+        if target.is_file():
+            target.unlink()
+    return RemuxOutput(
+        playlist=output.playlist,
+        init=output.init,
+        segments=tuple(s for s in output.segments if s.name not in drop_uris),
+    )
+
+
 def remux(
     src: str | Path,
     out_dir: str | Path,
     *,
     seconds: float | None = None,
     segment_seconds: float = 6.0,
-    maps: tuple[str, ...] = VIDEO_ONLY_MAPS,
+    maps: tuple[str, ...] = VIDEO_AUDIO_MAPS,
     name: str = "video",
+    normalize_timestamps: bool = True,
 ) -> tuple[SourceInfo, RemuxOutput]:
-    """探测 → 闸门 → remux → 定位产出。闸门不过就不动 ffmpeg。"""
+    """探测 → 闸门 → remux → 定位产出。闸门不过就不动 ffmpeg。
+
+    normalize_timestamps（默认开）会用 setts 把时间戳规整成 CFR —— 这是真机
+    黑屏的根因修复：源 DTS 非单调时，-c copy 会切出 3 帧残片且片内乱序，
+    AVPlayer 直接停播。关掉它只用于复现旧行为。
+    """
     source = probe(src)
     verdict = mvp_verdict(source)
     if not verdict.supported:
@@ -348,8 +684,10 @@ def remux(
             segment_seconds=segment_seconds,
             maps=maps,
             bsf=param_set_injection_bsf(source),
+            setts=setts_bsf(source) if normalize_timestamps else None,
         ),
         cwd=out_dir,
+        timeout=ffmpeg_timeout(seconds),
     )
     if not (out_dir / playlist).exists():
         raise RemuxError(f"ffmpeg 未产出列表：{proc.stderr.strip() or '未知错误'}")
@@ -357,6 +695,17 @@ def remux(
     output = resolve_output(out_dir / playlist)
     if not output.exists:
         raise RemuxError(f"产出不完整：init 或分片缺失（{proc.stderr.strip()}）")
+    # 残尾分片（末段仅 0.06s / 1~3 帧）先摘掉再转签：少一个让 AVPlayer
+    # 停住的黑屏风险源，代价是丢掉预览最后几十毫秒。
+    output = trim_stub_tail(output)
+
+    # 静态时间轴预检（Infuse FCPTSIncorrectnessDetector 思路）：在转签与
+    # ffprobe 复读之前用纯盒链解析抓 tfdt 回退 / 零 duration。坏包在这里
+    # 拒绝，不进后续任何一步。
+    problems = validate_segments(output)
+    if problems:
+        head = "；".join(p.describe() for p in problems[:3])
+        raise RemuxError(f"时间轴静态预检失败：{head}")
 
     # Apple HLS §1.9 只认 Profile 5：源是 P8 单层时把 init 段转签成 P5。
     # 只动配置 box 签名与 profile/level/compat，分片里的 RPU 一个字节都不碰。

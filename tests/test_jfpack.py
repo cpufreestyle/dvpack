@@ -17,8 +17,17 @@ import pytest
 from dvpack import serve as serve_module
 from dvpack.bmff import hvcC_param_set_types
 from dvpack.jfpack import _source_colorimetry, pack_source
+from dvpack.subsource import SubtitleResolution
 from dvpack.probe import NotProbeable, SourceInfo, VideoStream
-from dvpack.serve import ID_PATTERN, _cache_fresh, _src_fingerprint, _valid_pack_src, serve
+from dvpack.serve import (
+    ID_PATTERN,
+    _cache_fresh,
+    _src_fingerprint,
+    _valid_pack_src,
+    INSTANT_PACK_SECONDS,
+    WARM_PACK_SECONDS,
+    serve,
+)
 from dvpack.tools import FFMPEG
 
 SRC = Path(os.environ.get("DVPACK_SOURCE_MKV", ""))
@@ -172,6 +181,27 @@ def pack_site(tmp_path: Path, monkeypatch):
         (out / "master.m3u8").write_text(f"#EXTM3U\n{master_uri}\n", encoding="utf-8")
 
     monkeypatch.setattr(serve_module, "pack_source", fake_pack)
+    # /jf/pack 熱路徑在持鎖前會做字幕預檢（ffprobe + 字幕 HTTP），那是真網絡
+    # 請求。路由用例只該驗 302/400，不該依賴 192.168.1.68 在線：主機不可達時
+    # 首次連接卡在 ARP 等待上掛住好幾秒，客戶端 5s 超時（2026-10-06 實測）。
+    monkeypatch.setattr(
+        serve_module, "_subtitle_texts",
+        lambda src, root=None, info=None: SubtitleResolution(),
+    )
+    # seconds=0 用例会走 INSTANT_FIRST 分支并 spawn 两个后台线程（全片补包
+    # + 在线字幕）。fixture 拆完 monkeypatch 后 worker 才抢到 per-item 锁时，
+    # 真版 pack_source/_online_subs_body 会对着已拆除的 tmp 目录打
+    # 192.168.1.68——主机离线时挂数十秒，把下一个参数化用例的 /jf/pack
+    # 请求锁死到 5s 客户端超时（2026-10-07 实测 3 连红灯的根因）。
+    # 路由用例只验 302/400 与 calls 记账，spawn 一律 no-op。
+    monkeypatch.setattr(
+        serve_module.HlsRequestHandler, "_spawn_full_pack",
+        lambda self, src, item_id, maps: None,
+    )
+    monkeypatch.setattr(
+        serve_module.HlsRequestHandler, "_spawn_online_subs",
+        lambda self, src, item_id, out_dir: None,
+    )
     httpd = serve(root, 0)
     httpd.daemon_threads = True
     thread = _serve_in_thread(httpd)
@@ -226,9 +256,9 @@ def test_pack_redirects_to_absolute_master(pack_site):
 @pytest.mark.parametrize(
     ("requested", "expected"),
     [
-        ("0", 1.0),  # 下限
+        ("0", INSTANT_PACK_SECONDS),  # 0=全片：先秒开 20s，全片后台补
         ("-5", 1.0),
-        ("99999", 600.0),  # 上限
+        ("99999", WARM_PACK_SECONDS),  # 夹到上限后再受 warm 封顶
         ("30", 30.0),  # 区间内原样
     ],
 )
@@ -389,3 +419,136 @@ def test_jfpack_can_keep_colr_control_arm(tmp_path: Path):
     types = hvcC_param_set_types(init)
     assert 39 in types, f"对照臂应保留 39 数组，现有 {types}"
     assert result.verification.ok, result.verification.problems
+
+JF_SRC = "http://192.168.1.68:8096/Videos/ab47/stream.mkv?static=true&api_key=KEY"
+
+
+def _source_with_subtitle_streams(*subs):
+    import dataclasses
+
+    return dataclasses.replace(
+        _source_with_colour_tags("", "", ""),
+        subtitle_streams=tuple(subs),
+    )
+
+
+def test_jellyfin_subtitle_url_keeps_host_and_api_key():
+    """字幕端点必须同 host 带 api_key——换 host 或丢 key 就是 401/404。
+
+    2026-10-04：api_key 只从 src 的 query 派生，指纹不落盘也够用。
+    2026-10-05：端点改候选列表（Jellyfin 12.1 老格式 404），新格式排头。
+    """
+    from dvpack.jfpack import jellyfin_subtitle_urls
+
+    urls = jellyfin_subtitle_urls(JF_SRC, "ab47", 2, "srt")
+    assert urls == [
+        "http://192.168.1.68:8096/Videos/ab47/ab47/Subtitles/2/Stream.srt?api_key=KEY",
+        "http://192.168.1.68:8096/Videos/ab47/Subtitles/2/Stream.srt?api_key=KEY",
+    ]
+
+
+def test_jellyfin_subtitle_url_without_api_key():
+    from dvpack.jfpack import jellyfin_subtitle_urls
+
+    urls = jellyfin_subtitle_urls(
+        "http://192.168.1.68:8096/Videos/ab47/stream.mkv?static=true", "ab47", 3, "vtt"
+    )
+    assert urls == [
+        "http://192.168.1.68:8096/Videos/ab47/ab47/Subtitles/3/Stream.vtt",
+        "http://192.168.1.68:8096/Videos/ab47/Subtitles/3/Stream.vtt",
+    ]
+
+
+def test_jellyfin_subtitle_urls_media_source_id_from_query():
+    """src 带了 mediaSourceId 参数就优先用它，不再拿 itemId 顶替。"""
+    from dvpack.jfpack import jellyfin_subtitle_urls
+
+    src = JF_SRC + "&mediaSourceId=ms9"
+    urls = jellyfin_subtitle_urls(src, "ab47", 2, "srt")
+    assert urls[0].endswith(
+        "/Videos/ab47/ms9/Subtitles/2/Stream.srt?api_key=KEY"
+    )
+    assert urls[1].endswith("/Videos/ab47/Subtitles/2/Stream.srt?api_key=KEY")
+
+
+def test_fetch_subtitle_texts_falls_back_to_legacy_endpoint(monkeypatch):
+    """新端点失败（Jellyfin <10.9 不认带 mediaSourceId 的路径）时依次试旧端点。
+
+    反过来 Jellyfin 10.9+ 是新通旧 404（2026-10-05 实测 12.1），新格式排头即可。
+    """
+    from dvpack import jfpack
+    from dvpack.probe import SubtitleStream
+
+    source = _source_with_subtitle_streams(
+        SubtitleStream(index=42, codec="subrip", language="chi"),
+    )
+    seen: list[str] = []
+
+    def fake_curl(url, timeout=20.0):
+        seen.append(url)
+        if "/ab47/ab47/" in url:
+            raise jfpack.JfPackError("404（老服务器不认新格式）")
+        return "1\n00:00:01,000 --> 00:00:02,000\n你好\n".encode("utf-8")
+
+    monkeypatch.setattr(jfpack, "_curl_bytes", fake_curl)
+    texts = jfpack.fetch_subtitle_texts(JF_SRC, source)
+    assert "你好" in texts.get("zh", "")
+    assert len(seen) == 2  # 新端点试过失败，旧端点成功即止
+
+
+def test_fetch_subtitle_texts_downloads_only_text_zh_en(monkeypatch):
+    """只抓文本、只归一 zh/en；图像字幕不动、未知语言不动。
+
+    纽伦堡实测五条 hdmv_pgs_subtitle：不能触发任何下载，否则每个 /jf/pack
+    都白等几条 curl 超时。
+    """
+    from dvpack.jfpack import fetch_subtitle_texts
+    from dvpack.probe import SubtitleStream
+
+    calls = []
+
+    def fake_curl(url, timeout=20.0):
+        calls.append(url)
+        return "1\n00:00:01,000 --> 00:00:02,000\n你好\n\n".encode("utf-8")
+
+    monkeypatch.setattr("dvpack.jfpack._curl_bytes", fake_curl)
+    source = _source_with_subtitle_streams(
+        SubtitleStream(index=2, codec="subrip", language="chi"),
+        SubtitleStream(index=3, codec="hdmv_pgs_subtitle", language="eng"),
+        SubtitleStream(index=4, codec="subrip", language="jpn"),
+    )
+
+    texts = fetch_subtitle_texts(JF_SRC, source)
+    assert list(texts) == ["zh"]
+    assert texts["zh"].startswith("1\n")
+    assert len(calls) == 1
+    assert "/Subtitles/2/Stream.srt" in calls[0]
+
+
+def test_fetch_subtitle_texts_failure_returns_empty(monkeypatch):
+    """字幕抓取失败必须静默：字幕是增强项，不能把打包链路炸掉。
+
+    电视上表现为「无字幕可放」而不是「播放失败」。
+    """
+    from dvpack.jfpack import JfPackError, fetch_subtitle_texts
+    from dvpack.probe import SubtitleStream
+
+    def boom(url, timeout=20.0):
+        raise JfPackError("down")
+
+    monkeypatch.setattr("dvpack.jfpack._curl_bytes", boom)
+    source = _source_with_subtitle_streams(
+        SubtitleStream(index=2, codec="subrip", language="eng")
+    )
+    assert fetch_subtitle_texts(JF_SRC, source) == {}
+
+
+def test_fetch_subtitle_texts_without_item_id_returns_empty():
+    """src 不带 /Videos/<id>/ 就推不出字幕端点——不能瞎猜 host。"""
+    from dvpack.jfpack import fetch_subtitle_texts
+    from dvpack.probe import SubtitleStream
+
+    source = _source_with_subtitle_streams(
+        SubtitleStream(index=2, codec="subrip", language="chi")
+    )
+    assert fetch_subtitle_texts("http://192.168.1.68:8096/other/x.mkv", source) == {}

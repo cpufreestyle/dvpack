@@ -12,39 +12,28 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
-from .tools import FFPROBE, require
+from .dvprofile import (
+    PROFILE_VIDEO_RANGE_FALLBACK,
+    RISKY_P5_LEVELS,
+    TRANSFER_TO_VIDEO_RANGE,
+)
+from .tools import FFPROBE, probe_timeout, require
 
 DOVI_SIDEDATA = "DOVI configuration record"
 
 SHOW_ENTRIES = (
     "stream=index,codec_type,codec_name,profile,width,height,bit_depth,"
     "color_range,color_space,color_transfer,color_primaries,"
-    "avg_frame_rate,r_frame_rate,"
+    "avg_frame_rate,r_frame_rate,tags,"
     "stream_side_data"
     ":format=format_name,duration,size"
 )
 
-# 实测 transfer → Apple HLS 的 VIDEO-RANGE 属性值。
-# 实测优先，但 MKV rip 常常不写 colour tags（实测片源里就常缺），
-# 所以 DV 分支再按 profile 定义兜底。
-_TRANSFER_TO_VIDEO_RANGE = {
-    "smpte2084": "PQ",
-    "bt2020lc": "PQ",  # 部分容器把 PQ 报成这个
-    "arib-std-b67": "HLG",
-    "bt709": "SDR",
-}
-
-# Profile 5 按定义就是单层 BT.2020/PQ、无回退层；7 的基底是 HDR10；
-# 8 默认 8.1（HDR10 基底），8.4 才是 HLG——8.4 会在实测 transfer 里露出来，走上面那张表。
-_DVI_PROFILE_VIDEO_RANGE = {5: "PQ", 7: "PQ", 8: "PQ", 10: "PQ"}
-
-# 唯一有官方依据的 compat_id 取值（Apple 附录：db4h ↔ HLG）
+#: 唯一有官方依据的 compat_id 取值（Apple 附录：db4h ↔ HLG）
 _COMPAT_HLG = 4
-
-# Infuse 官方社区有报告：Profile 5 在 level 7 / 9 时不点亮 DV。
-# 未在自己的硬件上复现，所以只当风险项报出来，不当硬性拒绝。
-# 只限 Profile 5——Profile 8 在 level 7/9 是流媒体片源的常态，报它是噪音。
-_RISKY_P5_LEVELS = frozenset({7, 9})
+_TRANSFER_TO_VIDEO_RANGE = TRANSFER_TO_VIDEO_RANGE
+_DVI_PROFILE_VIDEO_RANGE = PROFILE_VIDEO_RANGE_FALLBACK
+_RISKY_P5_LEVELS = RISKY_P5_LEVELS
 
 
 @dataclass(frozen=True)
@@ -142,6 +131,21 @@ class SourceInfo:
     duration: float
     size: int
     video: VideoStream
+    #: 第一条音轨的 RFC 6381 codec 名（"aac" / "ec-3" / "ac-3"），没有音轨则空串。
+    #:
+    #: 2026-09-27：master 的 CODECS 必须列全变体里出现的**每一种** codec。
+    #: 这里曾经只写 dvh1.05.09，而产物已经带上了 aac 音轨——对不上，AVPlayer
+    #: 直接拒收整个 master：真机日志里只看到一次 /master.m3u8 200，之后
+    #: **一个分片都没再请求**，症状就是黑屏。别再把这里当装饰字段。
+    audio_codec: str = ""
+    #: 第一条音轨的原始 ffprobe codec_name（"dts" / "truehd" / "eac3"…）。
+    #: 与 audio_codec 的分工：后者只收 Apple 认识的编码，不认识返回空串；
+    #: 原始名用于区分「根本没有音轨」（只能纯视频包）与「有轨但 Apple 不认」
+    #: （转码 aac 保住声音）——2026-10-03 狂飙 ab476f 的 dts 音轨。
+    audio_codec_name: str = ""
+    #: 全部字幕流（文本 + 图像）。2026-10-04 双语字幕链路用：只取 is_text 的
+    #: 流下载，track_language 归一成 zh/en 后按语言各出一条 HLS 字幕轨。
+    subtitle_streams: tuple["SubtitleStream", ...] = ()
 
     @property
     def dovi(self) -> DoviRecord | None:
@@ -192,6 +196,66 @@ def _parse_dovi(sidedata: dict) -> DoviRecord:
     )
 
 
+_SUBTITLE_TEXT_CODECS = frozenset(
+    {"subrip", "webvtt", "mov_text", "text", "ass", "ssa"}
+)
+
+#: MKV / 流媒体字幕语言 tag → HLS 字幕轨语言。Jellyfin 的 MKV rip 语言 tag
+#: 五花八门（chi / zho / chs / cmn 都见过），不归一的话 tvOS 字幕选择器里
+#: 中英两条轨会裂成一堆单语言组。归一只认白名单，其余一律空串（= 跳过）。
+_LANGUAGE_ALIASES = {
+    "zh": "zh", "chi": "zh", "zho": "zh", "chs": "zh", "cmn": "zh",
+    "en": "en", "eng": "en",
+}
+
+
+def _normalize_language(tag: str) -> str:
+    """语言 tag 归一成 zh / en；取不到就空串（调用方跳过该轨）。"""
+    head = (tag or "").strip().lower().split("-")[0]
+    return _LANGUAGE_ALIASES.get(head, "")
+
+
+@dataclass(frozen=True)
+class SubtitleStream:
+    """ffprobe 报出来的一条字幕流。
+
+    只描述事实：index 给 Jellyfin 字幕下载端点用，codec 决定要不要下载
+    （pgssub/dvdsub 是图像，tvOS 的 WebVTT 轨塞不进去），language 归一后
+    决定落中轨还是英轨。
+    """
+
+    index: int
+    codec: str
+    language: str = ""
+
+    @property
+    def is_text(self) -> bool:
+        return (self.codec or "").lower() in _SUBTITLE_TEXT_CODECS
+
+    @property
+    def track_language(self) -> str:
+        return _normalize_language(self.language)
+
+
+def _parse_subtitles(streams: list[dict]) -> tuple[SubtitleStream, ...]:
+    """挑出全部字幕流（文本 + 图像都留，让调用方自己筛）。"""
+    subs: list[SubtitleStream] = []
+    for s in streams:
+        if s.get("codec_type") != "subtitle":
+            continue
+        tags = s.get("tags") or {}
+        # ffprobe 的 tag 名大小写随容器漂（MKV 走小写 language），两种都认。
+        language = tags.get("language") or tags.get("LANGUAGE") or ""
+        subs.append(
+            SubtitleStream(
+                index=int(s["index"]),
+                codec=(s.get("codec_name") or "").lower(),
+                language=str(language),
+            )
+        )
+    return tuple(subs)
+
+
 def _parse_video(stream: dict) -> VideoStream:
     dovi = None
     for sidedata in stream.get("side_data_list") or []:
@@ -215,6 +279,37 @@ def _parse_video(stream: dict) -> VideoStream:
     )
 
 
+#: ffprobe 的 codec_name → RFC 6381 codec 串（master 的 CODECS 要写后者）。
+#: 没收录的直接不认——宁可少写，也不能写错把整个 master 弄成非法
+#:（AVPlayer 会直接拒收，连 init.mp4 都不请求）。2026-10-03《纽伦堡》实测：
+#: CODECS 写 "aac" 时电视只拉 master.m3u8 + video.m3u8 就放弃；HLS 的 AAC
+#: 码串是 RFC 6381 风格（mp4a.40.2），不是 ffprobe 的 codec_name "aac"。
+_AUDIO_RFC6381 = {
+    "aac": "mp4a.40.2",
+    "ac3": "ac-3",
+    "eac3": "ec-3",
+    "mp3": "mp4a.40.34",
+    "opus": "opus",
+    "flac": "flac",
+}
+
+
+def _audio_codec(streams: list[dict]) -> str:
+    """取第一条音轨的 RFC 6381 名；没有音轨或 codec 不认识就返回空串。"""
+    audio = next((s for s in streams if s.get("codec_type") == "audio"), None)
+    if audio is None:
+        return ""
+    return _AUDIO_RFC6381.get((audio.get("codec_name") or "").lower(), "")
+
+
+def _audio_codec_name(streams: list[dict]) -> str:
+    """第一条音轨的原始 codec_name；没有音轨则空串。"""
+    audio = next((s for s in streams if s.get("codec_type") == "audio"), None)
+    if audio is None:
+        return ""
+    return (audio.get("codec_name") or "").lower()
+
+
 def parse_probe_json(obj: dict, path: Path) -> SourceInfo:
     """从 ffprobe 的 JSON 结果构造 SourceInfo。纯函数，测试不打进程。"""
     fmt = obj.get("format") or {}
@@ -228,6 +323,9 @@ def parse_probe_json(obj: dict, path: Path) -> SourceInfo:
         duration=float(fmt.get("duration") or 0.0),
         size=int(fmt.get("size") or 0),
         video=_parse_video(video),
+        audio_codec=_audio_codec(streams),
+        audio_codec_name=_audio_codec_name(streams),
+        subtitle_streams=_parse_subtitles(streams),
     )
 
 
@@ -263,7 +361,18 @@ def ffprobe_json(source: str | Path) -> dict:
         SHOW_ENTRIES,
         str(source),
     ]
-    proc = subprocess.run(argv, capture_output=True, text=True, encoding="utf-8")
+    # subprocess 级执行超时（不是 ffmpeg 的 -timeout 网络选项）：Jellyfin 流
+    # 半路卡死时 ffprobe 永不返回，调用线程（serve 的请求线程）跟着挂死。
+    # 超时转 NotProbeable，走调用方既有的坏源分支。
+    cap = probe_timeout()
+    try:
+        proc = subprocess.run(
+            argv, capture_output=True, text=True, encoding="utf-8", timeout=cap
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise NotProbeable(
+            f"ffprobe 执行超时（>{cap:.0f}s）：{source}（上游流卡死）"
+        ) from exc
     if proc.returncode != 0 or not proc.stdout.strip():
         # ffprobe 的失败原因全在 stderr（-v quiet 下尤其），丢了它现场全盲：
         # launchd 出站被 TCC 拦成 EHOSTUNREACH 那次，就靠这行才定位到根因。

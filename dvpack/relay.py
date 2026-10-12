@@ -20,9 +20,13 @@ from __future__ import annotations
 import shutil
 import subprocess
 import threading
+import socket
+import struct
+import time
+from dataclasses import dataclass, field
+from urllib.parse import parse_qs, quote, urljoin, urlsplit
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, quote, urljoin, urlsplit
 
 # 只认 Apple 平台二进制这个：PATH 里的第三方 curl 同样会被墙。
 CURL = Path("/usr/bin/curl")
@@ -78,6 +82,117 @@ _PASSTHROUGH = (
 
 MAX_REDIRECTS = 5
 _REDIRECT_STATUS = frozenset({301, 302, 303, 307, 308})
+
+# Range 缓存（Infuse InputStreamCacheRangeAccess/ReadAheadLoader 学习项）：
+#
+# ffprobe/ffmpeg 的 I/O 形状是「多次小 Range 请求 + 少量顺序大读」。Jellyfin
+# 端对同一个 URL 会收到 probe、pack、poster、字幕解析多次重叠请求。这里
+# 给每个源 URL 维护一份区间记账：同进程内第二次请求同一区间时直接复用
+# 上次拉到的字节，不重复打 Jellyfin（2026-10-04 的 34 路压垮事故就是
+# 同一目录 34 个并发请求）。
+#
+# 刻意不做磁盘缓存：serve 已有产物级缓存（/_jf/<id>/），这一层只省
+# 同一进程内的重复网络 I/O。区间上限 32MB，防长片全片驻内存。
+RANGE_CACHE_LIMIT = 32 * 1024 * 1024
+
+
+@dataclass
+class _RangeEntry:
+    start: int
+    end: int  # inclusive
+    data: bytes
+    total: int | None = None
+    content_type: str | None = None
+    atime: float = field(default_factory=lambda: 0.0)
+
+
+class _RangeCache:
+    """线程安全的 per-URL Range 缓存：区间合并 + LRU 驱逐。"""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._ranges: dict[str, list[_RangeEntry]] = {}
+        self._total = 0
+
+    def _key(self, url: str) -> str:
+        return _safe_url(url)  # key 不带 api_key，防不同 token 同路径分裂
+
+    def lookup(self, url: str, start: int, end: int) -> bytes | None:
+        with self._lock:
+            entries = self._ranges.get(self._key(url))
+            if not entries:
+                return None
+            hits = [e for e in entries if e.start <= start and end <= e.end]
+            if not hits:
+                return None
+            entry = hits[0]
+            entry.atime = time.time()
+            return entry.data[start - entry.start : end - entry.start + 1]
+
+    def lookup_entry(self, url: str, start: int, end: int) -> _RangeEntry | None:
+        """命中并返回整条 entry（命中路径要回放 total）。"""
+        with self._lock:
+            entries = self._ranges.get(self._key(url))
+            if not entries:
+                return None
+            hits = [e for e in entries if e.start <= start and end <= e.end]
+            if not hits:
+                return None
+            hits[0].atime = time.time()
+            return hits[0]
+
+    def store(self, url: str, start: int, data: bytes, total: int | None = None,
+              content_type: str | None = None) -> None:
+        with self._lock:
+            key = self._key(url)
+            entries = self._ranges.setdefault(key, [])
+            end = start + len(data) - 1
+            # 与现有区间重叠就跳过：先来的数据已覆盖了那个区间
+            for existing in entries:
+                if existing.start <= start and end <= existing.end:
+                    return
+            entry = _RangeEntry(start=start, end=end, data=data, total=total,
+                                content_type=content_type, atime=time.time())
+            entries.append(entry)
+            self._total += len(data)
+            while self._total > RANGE_CACHE_LIMIT and entries:
+                oldest = min(entries, key=lambda e: e.atime)
+                entries.remove(oldest)
+                self._total -= len(oldest.data)
+
+
+_range_cache = _RangeCache()
+
+
+def _parse_range(header: str | None) -> tuple[int, int] | None:
+    """"Range: bytes=A-B"（单个有界区间）→ (A, B)；其余形态回 None（不猜）。
+
+    开区间（bytes=A-）与多段 Range 必须回 None：本层只会按"完整覆盖即命中"
+    回放，把开区间当 (A,A) 单字节处理会让命中路径只回 1 字节——客户端要的
+    是从 A 起的整条流，ffmpeg 的读循环会当场断掉。这些请求走上游完整语义。
+    """
+    if not header or not header.startswith("bytes="):
+        return None
+    spec = header[len("bytes="):].strip()
+    if "," in spec:
+        return None  # 多段 Range 超出本层：回源转发
+    first, sep, last = spec.partition("-")
+    if not sep or not first or not last:
+        return None
+    try:
+        start, end = int(first), int(last)
+    except ValueError:
+        return None
+    if start < 0 or end < start:
+        return None
+    return start, end
+
+# 上游假死（TCP 接受连接但一个字节都不回，2026-10-03 Jellyfin 现场）时，
+# 等响应头的 readline 会永久阻塞：ffprobe/ffmpeg 挂在半死的 curl 上，
+# /jf/pack 永不返回，电视上的症状是「点了海报没反应」。给响应头阶段
+# 加看门狗：超时就杀掉 curl，让上层 502 快失败。body 流式转发不设上限
+# ——ffprobe 拉全片是分钟级，误杀会截断源文件。
+HEADER_TIMEOUT = 12.0
 
 
 class _UpstreamError(Exception):
@@ -143,11 +258,34 @@ def _curl_response(target: str, method: str, rng: str | None):
     argv.append(target)
     proc = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     head_lines: list[bytes] = []
-    while True:
-        line = proc.stdout.readline() if proc.stdout is not None else b""
-        if not line or not line.strip():
-            break
-        head_lines.append(line)
+    done = threading.Event()
+
+    def _watchdog() -> None:
+        if not done.wait(HEADER_TIMEOUT):
+            proc.kill()  # 杀掉挂死的 curl，readline 随即拿到 EOF
+
+    watcher = threading.Thread(
+        target=_watchdog, name="dvpack-relay-watchdog", daemon=True
+    )
+    watcher.start()
+    saw_blank = False
+    try:
+        while True:
+            line = proc.stdout.readline() if proc.stdout is not None else b""
+            if not line:
+                break  # curl 被杀或上游断开
+            if not line.strip():
+                saw_blank = True
+                break
+            head_lines.append(line)
+    finally:
+        done.set()
+    if head_lines and not saw_blank:
+        detail = _reap(proc, detail=True)
+        raise _UpstreamError(
+            f"上游响应头不完整：{_safe_url(target)}"
+            + (f" -- {detail}" if detail else "")
+        )
     if not head_lines:
         detail = _reap(proc, detail=True)
         raise _UpstreamError(
@@ -204,6 +342,28 @@ class _RelayHandler(BaseHTTPRequestHandler):
             self._fail(400, "missing u")
             return
 
+        # Range 缓存命中：不再起 curl。只缓存完整收到的区间（见下方 store）。
+        rng = _parse_range(self.headers.get("Range"))
+        entry = None
+        if rng is not None and with_body:
+            entry = _range_cache.lookup_entry(target, rng[0], rng[1])
+        if entry is not None:
+            cached = entry.data[rng[0] - entry.start : rng[1] - entry.start + 1]
+            self.send_response(206)
+            self.send_header("Content-Type",
+                              entry.content_type or "application/octet-stream")
+            total = entry.total if entry.total is not None else entry.end + 1
+            self.send_header(
+                "Content-Range", f"bytes {rng[0]}-{rng[1]}/{total}"
+            )
+            self.send_header("Content-Length", str(len(cached)))
+            self.end_headers()
+            try:
+                self.wfile.write(cached)
+            except OSError:
+                pass
+            return
+
         try:
             proc, head_lines, status = self._open_upstream(target)
         except _UpstreamError as exc:
@@ -218,17 +378,73 @@ class _RelayHandler(BaseHTTPRequestHandler):
                 self.send_header(name.strip(), value.strip())
         self.end_headers()
 
+        sent = 0
+        received: bytes = b""
+        store_candidate = rng is not None and with_body
+        content_range_start: int | None = None
+        content_range_total: int | None = None
+        upstream_type = _header_value(head_lines, "content-type")
+        content_range = _header_value(head_lines, "content-range")
+        if content_range and content_range.startswith("bytes "):
+            try:
+                body_spec, _, total_spec = content_range[len("bytes "):].partition("/")
+                start_spec, _, _ = body_spec.partition("-")
+                content_range_start = int(start_spec)
+                content_range_total = int(total_spec) if total_spec.isdigit() else None
+            except ValueError:
+                content_range_start = None
         if with_body and proc.stdout is not None:
             while True:
                 chunk = proc.stdout.read(65536)
                 if not chunk:
                     break
+                sent += len(chunk)
+                if store_candidate and sent <= RANGE_CACHE_LIMIT:
+                    received += chunk
                 try:
                     self.wfile.write(chunk)
                 except OSError:
                     break  # ffmpeg 半路走掉（推测请求/切码率），安静收场
 
         _reap(proc)
+
+        # 截断检测（2026-10-04 深夜 34 部毒包事故）：上游被 Jellyfin 压断时
+        # curl 要么退出码非 0、要么实收字节少于 Content-Length，但 body 转发
+        # 循环只看到管道 EOF——旧实现当干净 EOF 转发，ffmpeg 正常退出、产出
+        # 2~4 段带 ENDLIST 的「全片」毒包，电视点片只能放 24 秒且永不自愈。
+        # 这里对客户端连接发 RST（SO_LINGER (1,0)），让 ffmpeg 报连接错误
+        # exit!=0，上层 502 失败——宁可让用户重试，绝不给毒包落盘机会。
+        if with_body and proc.stdout is not None:
+            declared = _header_value(head_lines, "content-length")
+            expected = int(declared) if declared and declared.isdigit() else None
+            if expected is not None and (proc.returncode != 0 or sent < expected):
+                print(
+                    f"[relay] 上游截断：curl rc={proc.returncode} "
+                    f"实收 {sent}B < 声明 {expected}B，RST 客户端连接",
+                    flush=True,
+                )
+                try:
+                    self.connection.setsockopt(
+                        socket.SOL_SOCKET,
+                        socket.SO_LINGER,
+                        struct.pack("ii", 1, 0),
+                    )
+                except OSError:
+                    pass
+            # 完整收到的区间才进缓存：截断事故（实收 < Content-Length）
+            # 的数据绝不能被复用，否则缓存会把毒数据固化为"已知好数据"。
+            complete = (
+                proc.returncode == 0
+                and expected is not None
+                and sent == expected
+                and status == 206
+                and content_range_start is not None
+                and sent == len(received)
+            )
+            if complete:
+                _range_cache.store(target, content_range_start, received,
+                                   total=content_range_total,
+                                   content_type=upstream_type)
 
     def log_message(self, format: str, *args) -> None:  # noqa: A002 - 基类签名
         pass  # 每次探测/分片都记会把 serve 日志淹掉，出错由 502 状态码暴露

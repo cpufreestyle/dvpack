@@ -8,11 +8,13 @@ from __future__ import annotations
 
 import http.client
 import ipaddress
+import json
 import os
 from pathlib import Path
 
 import pytest
 from dvpack import serve as serve_module
+from dvpack.playlist import Variant, write_master_playlist
 from dvpack.serve import (
     FULL,
     PARTIAL,
@@ -242,3 +244,260 @@ def test_lan_address_last_resort_is_loopback(monkeypatch):
 def test_lan_address_on_this_host():
     """本机真跑一遍枚举：必须返回一个可解析的 IPv4 字面量。"""
     ipaddress.ip_address(lan_address())
+
+
+@pytest.fixture
+def jfsite(tmp_path: Path):
+    """带 _jf pack 缓存的服务根：删一部片要连它的缓存一起删。"""
+    root = tmp_path / "public"
+    root.mkdir()
+    (root / "master.m3u8").write_bytes(b"#EXTM3U\n")
+    cache = root / "_jf"
+    victim = cache / "ab476f22b8fe82ec91a77886310c06fc"
+    victim.mkdir(parents=True)
+    (victim / "video.m3u8").write_bytes(b"#EXTM3U\n0.m4s\n")
+    (victim / "0.m4s").write_bytes(b"x" * 4096)
+    keep = cache / "ff951e2e8ce84efcf5a7bcb7de918d8f"
+    keep.mkdir(parents=True)
+    (keep / "video.m3u8").write_bytes(b"#EXTM3U\n")
+    httpd = serve(root, 0)
+    httpd.daemon_threads = True
+    thread = _serve_in_thread(httpd)
+    try:
+        yield httpd.server_address[1], victim, keep
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+        thread.join(timeout=5)
+
+
+def test_purge_deletes_pack_cache_and_reports_freed_bytes(jfsite):
+    port, victim, keep = jfsite
+    resp, body = _get(port, "/jf/purge?id=ab476f22b8fe82ec91a77886310c06fc")
+    assert resp.status == 200
+    payload = json.loads(body)
+    assert payload["id"] == "ab476f22b8fe82ec91a77886310c06fc"
+    assert payload["existed"] is True
+    assert payload["freed_bytes"] > 4096
+    assert not victim.exists()
+    assert keep.is_dir()  # 只删指定的那一部，别把别人的缓存顺手带走
+
+
+def test_purge_unknown_item_is_a_noop(jfsite):
+    port, _, keep = jfsite
+    resp, body = _get(port, "/jf/purge?id=00000000000000000000000000000000")
+    assert resp.status == 200
+    assert json.loads(body)["existed"] is False
+    assert keep.is_dir()
+
+
+@pytest.mark.parametrize("bad", ["", ".", "..", "...", "a/../b", "x" * 65])
+def test_purge_rejects_bad_id(jfsite, bad):
+    "" ".. 能穿过 ID_PATTERN：不拦住就是 rmtree 整个服务根目录。" ""
+    port, _, keep = jfsite
+    resp, _ = _get(port, "/jf/purge?id=" + bad)
+    assert resp.status == 400
+    assert keep.is_dir()
+    assert (keep / "video.m3u8").exists()
+
+
+# ── 在线字幕腿（_online_subs_body）：只由后台线程跑，永不进 302 热路径 ───
+_SRC = "http://192.168.1.68:8096/videos/534f/stream.mkv?api_key=secret"
+_TEXTS = {
+    "zh": "1\n00:00:01,000 --> 00:00:03,000\n世界\n",
+    "en": "1\n00:00:01,000 --> 00:00:03,000\nWorld\n",
+}
+
+
+def _fake_pack(out_dir: Path) -> None:
+    variant = Variant(
+        uri="/_jf/534f/video.m3u8",
+        bandwidth=12_000_000,
+        codecs="hvc1.2.4.L153.B0,ec-3",
+        video_range="PQ",
+        resolution=(3840, 2160),
+        frame_rate=24.0,
+        hdcp_level="TYPE-1",
+        supplemental_codecs="dvh1.05.06/db1p",
+    )
+    write_master_playlist(out_dir / "master.m3u8", [variant])
+
+
+def test_subtitle_texts_hot_path_never_goes_online(tmp_path: Path, monkeypatch):
+    """点片热路径只做本地两级解析；在线抓取分钟级，绝不能堵在 302 前。"""
+    from dvpack import jfpack, relay, subsource
+
+    monkeypatch.setattr(relay, "ffmpeg_visible_source", lambda src: src)
+    monkeypatch.setattr(jfpack, "fetch_subtitle_texts", lambda src, info: {})
+
+    def _boom(**_kwargs):
+        raise AssertionError("在线腿不许进热路径")
+
+    monkeypatch.setattr(subsource, "fetch_online_texts", _boom)
+    resolution = serve_module._subtitle_texts(_SRC, root=tmp_path, info=object())
+    assert resolution.texts == {}
+
+
+def test_online_subs_body_fetches_caches_and_upgrades(tmp_path: Path, monkeypatch):
+    """抓到字幕：落 _subs 缓存 + 给已在播的包只换 master 字幕轨。"""
+    from dvpack import subsource
+
+    out_dir = tmp_path / "pack"
+    out_dir.mkdir()
+    _fake_pack(out_dir)
+    monkeypatch.setattr(serve_module, "_jf_item_name", lambda src, item_id: "奎迪2")
+    monkeypatch.setattr(subsource, "fetch_online_texts",
+                        lambda **kw: (dict(_TEXTS), "subhd rc=0"))
+    receipt = serve_module._online_subs_body(tmp_path, _SRC, "534f", out_dir)
+    assert "zh+en" in receipt
+    cache_dir = subsource.subtitle_cache_dir(
+        tmp_path, serve_module._src_fingerprint(_SRC))
+    cached, meta = subsource.load_cached_texts(cache_dir)
+    assert set(cached) == {"zh", "en"}
+    assert meta["source"] == subsource.ONLINE
+    assert not subsource.cache_blocked(cache_dir)
+    master = (out_dir / "master.m3u8").read_text(encoding="utf-8")
+    assert 'TYPE=SUBTITLES' in master and 'URI="sub_zh.m3u8"' in master
+
+
+def test_online_subs_body_skips_while_negative_cache_blocks(tmp_path: Path, monkeypatch):
+    """负缓存 TTL 内直接短路：不查片名、不起子进程、不烧公网。"""
+    from dvpack import subsource
+
+    def _boom(**_kwargs):
+        raise AssertionError("负缓存期内不许联网")
+
+    monkeypatch.setattr(subsource, "fetch_online_texts", _boom)
+    def _no_name(src, item_id):
+        raise AssertionError("短路时不许查片名")
+
+    monkeypatch.setattr(serve_module, "_jf_item_name", _no_name)
+    cache_dir = subsource.subtitle_cache_dir(
+        tmp_path, serve_module._src_fingerprint(_SRC))
+    subsource.record_online_failure(cache_dir, "subhd rc=35")
+    assert subsource.cache_blocked(cache_dir)
+    receipt = serve_module._online_subs_body(tmp_path, _SRC, "534f", tmp_path)
+    assert "负缓存" in receipt
+
+
+def test_online_subs_body_records_failure_when_fetch_empty(tmp_path: Path, monkeypatch):
+    """没抓到：落负缓存（TTL 内不重试），master 不许被动过。"""
+    from dvpack import subsource
+
+    out_dir = tmp_path / "pack"
+    out_dir.mkdir()
+    _fake_pack(out_dir)
+    monkeypatch.setattr(serve_module, "_jf_item_name", lambda src, item_id: "风味人间")
+    monkeypatch.setattr(subsource, "fetch_online_texts",
+                        lambda **kw: ({}, "subhd rc=35"))
+    receipt = serve_module._online_subs_body(tmp_path, _SRC, "5350", out_dir)
+    assert "未拿到" in receipt and "rc=35" in receipt
+    cache_dir = subsource.subtitle_cache_dir(
+        tmp_path, serve_module._src_fingerprint(_SRC))
+    assert subsource.cache_blocked(cache_dir)
+    master = (out_dir / "master.m3u8").read_text(encoding="utf-8")
+    assert "TYPE=SUBTITLES" not in master
+
+
+def test_online_subs_body_respects_off_switch(tmp_path: Path, monkeypatch):
+    from dvpack import subsource
+
+    monkeypatch.setenv(subsource.ONLINE_ENV, "0")
+    def _boom(**_kwargs):
+        raise AssertionError("开关关了还抓什么")
+    monkeypatch.setattr(subsource, "fetch_online_texts", _boom)
+    receipt = serve_module._online_subs_body(tmp_path, _SRC, "534f", tmp_path)
+    assert "已关" in receipt and subsource.ONLINE_ENV in receipt
+
+
+def test_online_subs_body_hands_item_name_to_fetcher(tmp_path: Path, monkeypatch):
+    """Jellyfin 真片名必须传到抓取侧；空片名 = 在线腿整体跳过。"""
+    from dvpack import subsource
+
+    seen: dict = {}
+
+    def fake_fetch(**kw):
+        seen.update(kw)
+        return ({}, "空片名" if not kw.get("name") else "other")
+
+    monkeypatch.setattr(subsource, "fetch_online_texts", fake_fetch)
+    monkeypatch.setattr(serve_module, "_jf_item_name", lambda src, item_id: "")
+    receipt = serve_module._online_subs_body(tmp_path, _SRC, "5360", tmp_path)
+    assert seen["item_id"] == "5360" and seen["name"] == ""
+    assert "未拿到" in receipt
+
+
+class TestPackFullSwapTmpName:
+    def test_upgrade_tmp_name_carries_pid(self, tmp_path, monkeypatch):
+        """临时目录名带 pid：prewarm CLI 与 serve 守护进程是两个进程，
+        _pack_lock_for 只是进程内 threading.Lock 互锁不到——固定名临时目录
+        会被并发互 rmtree，毒包事故同款机理的跨进程版。"""
+        seen: dict = {}
+
+        def fake_parallel(src, tmp, maps, texts):
+            seen["tmp"] = Path(tmp)
+            return True
+
+        monkeypatch.setattr(serve_module, "_parallel_full", fake_parallel)
+        monkeypatch.setattr(
+            serve_module, "_write_marker",
+            lambda tmp, marker: (Path(tmp) / "source.json").write_text("{}"))
+        monkeypatch.setattr(serve_module, "_src_duration_seconds",
+                            lambda src: 42.0)
+        monkeypatch.setattr(serve_module, "_rename_swap",
+                            lambda src, dst: os.rename(src, dst))
+
+        out = tmp_path / "_jf" / "i1"
+        out.mkdir(parents=True)
+        serve_module._pack_full_swap(
+            "http://127.0.0.1:8899/Videos/i1/stream.mkv?static=true",
+            out, [], [], "i1")
+
+        assert seen["tmp"].name == "._upgrade_i1_%d" % os.getpid()
+        assert seen["tmp"].parent == tmp_path / "_jf"
+        assert (out / "source.json").exists()  # 换装后新内容到位
+        assert not seen["tmp"].exists()  # 临时目录已让位
+
+
+class TestSweepStaleSwaps:
+    def test_dead_pid_dirs_swept_live_and_named_kept(self, tmp_path):
+        """死 pid 的 ._upgrade_*/._trash_* 扫掉；活 pid 和 v48 前固定名
+        （判不出活性）都不碰。"""
+        import subprocess
+        import sys
+
+        child = subprocess.Popen([sys.executable, "-c", "pass"])
+        child.wait()  # 回收掉，pid 确定已死（不留僵尸）
+        dead = child.pid
+        parent = tmp_path / "_jf"
+        parent.mkdir()
+        (parent / ("._upgrade_aaaa_%d" % dead)).mkdir()
+        (parent / ("._trash_bbbb_%d" % dead)).mkdir()
+        live = parent / ("._upgrade_cccc_%d" % os.getpid())
+        live.mkdir()
+        named = parent / "._upgrade_82caf5"
+        named.mkdir()
+        (parent / "i1").mkdir()
+
+        assert serve_module._sweep_stale_swaps(parent) == 2
+        assert not (parent / ("._upgrade_aaaa_%d" % dead)).exists()
+        assert not (parent / ("._trash_bbbb_%d" % dead)).exists()
+        assert live.exists() and named.exists() and (parent / "i1").exists()
+
+
+class TestPackFullSwapInterrupt:
+    def test_tmp_cleaned_on_keyboard_interrupt(self, tmp_path, monkeypatch):
+        """Ctrl-C 也要清自己的 tmp：全靠 except BaseException 兜底。"""
+        def boom(src, tmp, maps, texts):
+            (Path(tmp) / "junk.m4s").write_text("x")
+            raise KeyboardInterrupt
+
+        monkeypatch.setattr(serve_module, "_parallel_full", boom)
+        out = tmp_path / "_jf" / "i1"
+        out.mkdir(parents=True)
+        expected_tmp = tmp_path / "_jf" / ("._upgrade_i1_%d" % os.getpid())
+        with pytest.raises(KeyboardInterrupt):
+            serve_module._pack_full_swap(
+                "http://127.0.0.1:8899/Videos/i1/stream.mkv?static=true",
+                out, [], [], "i1")
+        assert not expected_tmp.exists()

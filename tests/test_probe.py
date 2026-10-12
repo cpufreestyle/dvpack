@@ -149,7 +149,9 @@ def test_color_range_passes_through_to_source_info():
     full["color_range"] = "pc"
     source = parse_probe_json(_wrap(full), Path("x.mkv"))
     assert source.video.color_range == "pc"
-    assert source_full_range(source) == 1
+    # SPS 侧恒定签 limited：DV P5 的 BL 按 Dolby 规范就是 limited，
+    # 2026-09-27 真机实证透传容器 pc 会点亮失败（见 remux 点亮版注释）
+    assert source_full_range(source) == 0
 
 
 def test_missing_color_range_is_limited_not_full():
@@ -301,3 +303,79 @@ def test_show_entries_covers_every_field_parse_video_reads():
     assert read, "没抓到任何字段，源码结构变了"
     missing = read - requested
     assert not missing, f"SHOW_ENTRIES 漏了这些字段：{sorted(missing)}"
+
+def _wrap_multi(*streams: dict) -> dict:
+    payload = _wrap(streams[0])
+    payload["streams"] = list(streams)
+    return payload
+
+
+_SUB_TEXT = {
+    "index": 2,
+    "codec_type": "subtitle",
+    "codec_name": "subrip",
+    "tags": {"language": "chi"},
+}
+
+_SUB_PGS = {
+    "index": 3,
+    "codec_type": "subtitle",
+    "codec_name": "hdmv_pgs_subtitle",
+    "tags": {"language": "eng"},
+}
+
+
+def test_mixed_text_and_image_subtitle_streams_are_parsed():
+    """文本 + 图像字幕混排是常态（纽伦堡：5 条 PGS），两条都要报出来。
+
+    只报文本会让调用方误以为「这片没字幕」；只报图像会让下载白跑。
+    is_text / track_language 就是给调用方的筛子。
+    """
+    source = parse_probe_json(_wrap_multi(P5_L6, _SUB_TEXT, _SUB_PGS), Path("x.mkv"))
+    assert len(source.subtitle_streams) == 2
+    text, image = source.subtitle_streams
+    assert (text.index, text.codec, text.language) == (2, "subrip", "chi")
+    assert text.is_text
+    assert text.track_language == "zh"
+    assert (image.index, image.codec, image.language) == (3, "hdmv_pgs_subtitle", "eng")
+    assert not image.is_text
+    assert image.track_language == "en"
+
+
+@pytest.mark.parametrize(
+    "tag,want",
+    [
+        ("zh", "zh"),
+        ("chi", "zh"),
+        ("zho", "zh"),
+        ("chs", "zh"),
+        ("cmn", "zh"),
+        ("zh-CN", "zh"),
+        ("ZH-Hans", "zh"),
+        ("en", "en"),
+        ("eng", "en"),
+        ("en-US", "en"),
+        ("und", ""),
+        ("jpn", ""),
+        ("", ""),
+        (None, ""),
+    ],
+)
+def test_language_tag_normalizes_to_zh_or_en(tag, want):
+    """语言 tag 五花八门（MKV 走 chi/zh-CN，Jellyfin 走 zho/cmn）。
+
+    归一只认 zh/en 是硬约定：双语轨一个语言一条 HLS 轨，漏一种语言
+    用户侧就少一条可选字幕。
+    """
+    from dvpack.probe import _normalize_language
+
+    assert _normalize_language(tag) == want
+
+
+def test_show_entries_requests_tags():
+    """字幕语言住在 tags.language 里——漏请求它，双语轨按语言分家就全瞎。
+
+    与 test_show_entries_covers_every_field_parse_video_reads 同一类事故的
+    字幕版防线：字段在代码里、-show_entries 没问，静默变空串。
+    """
+    assert "tags" in SHOW_ENTRIES

@@ -1,6 +1,19 @@
 tools/
 _out/
+out/
+*.egg-info/
+.venv/
+.DS_Store
+scr_*.png
+_cmp*.py
+_repack.py
+_fixmaster.py
+_relight_v3.sh
 __pycache__/
 *.pyc
 .pytest_cache/
 _scratch/
+# agent tool state (plugin_local_root 探针落点)
+.mimos[a]/
+.v2c/
+.video_agent/

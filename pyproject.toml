@@ -1,0 +1,35 @@
+[project]
+name = "dvpack"
+version = "0.2.0"
+description = "Dolby Vision HLS 打包器 + Jellyfin 片库投喂服务（tvOS 直连）"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+    # 参照项目：subfetch 的 OS hash 与 subliminal 同口径，m3u8 用于
+    # 列表产物的独立解析校验（tests/  importorskip 处理缺失）
+    "subliminal>=2.3",
+    "m3u8>=6",
+    "babelfish>=0.6",
+]
+
+[project.scripts]
+dvpack = "dvpack.__main__:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+# 根目录有 logs/ 等杂物目录，禁自动发现，只打 dvpack 一个包
+packages = ["dvpack"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[[tool.uv.index]]
+# 本机网络面：GitHub 与 PyPI 官网不通，清华源通（2026-10-05 实测）
+url = "https://pypi.tuna.tsinghua.edu.cn/simple"
+default = true

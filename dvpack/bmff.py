@@ -13,12 +13,21 @@ DoviRecord 请用 dvpack.probe——两边都走同一个 ffprobe，差异只可
 from __future__ import annotations
 
 import os
+import struct
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 
-DV_SAMPLE_ENTRIES = frozenset({"dvh1", "dvhe", "dav1"})
-VIDEO_SAMPLE_ENTRIES = DV_SAMPLE_ENTRIES | {"hvc1", "hev1", "avc1", "avc3", "av01", "vp09"}
+from .dvprofile import (
+    DV_BOX_NAMES,
+    DV_SAMPLE_ENTRIES,
+    MANDATORY_PARAM_SETS,
+    NON_DV_SAMPLE_ENTRIES,
+    RPU_NAL_PREFIX,
+    RPU_NAL_TYPES,
+)
+
+VIDEO_SAMPLE_ENTRIES = DV_SAMPLE_ENTRIES | NON_DV_SAMPLE_ENTRIES
 
 # 纯容器：box header 之后直接是子 box
 _PURE_CONTAINERS = frozenset(
@@ -35,14 +44,9 @@ _FULL_CONTAINERS = frozenset({"meta", "ipro", "sinf", "rinf", "stsd"})
 # 那 16 字节前导最容易被漏掉，而 dvh1 就是照 hvc1（VisualSampleEntry）派生的。
 _VISUAL_ENTRY_EXTRA = 8 + 16 + 54
 
-_RPU_NAL_TYPES = frozenset({62, 63})  # HEVC unregistered prefix / suffix NAL，DV 用它带 RPU
-# type 62 的 NAL header 是 `7c 01`，其后第一个 payload 字节是 rpu_nal_prefix=25。
-# 实测自本机片源，且与 dovi_tool `info` 输出的 rpu_nal_prefix 一致。
-_RPU_NAL_PREFIX = 0x19
-
-# VPS(32)/SPS(33)/PPS(34)：Apple HLS/fMP4 要求 init 段 hvcC 自带的必需参数集，
-# drop_hvcC_param_set_type 拒绝删除这三类，防调用方误用毁掉解码信令。
-_MANDATORY_PARAM_SETS = frozenset({32, 33, 34})
+_RPU_NAL_TYPES = RPU_NAL_TYPES  # HEVC unregistered prefix / suffix NAL，DV 用它带 RPU
+_RPU_NAL_PREFIX = RPU_NAL_PREFIX  # type 62 NAL header 后的 rpu_nal_prefix=25
+_MANDATORY_PARAM_SETS = MANDATORY_PARAM_SETS  # VPS/SPS/PPS，见 dvprofile 注释
 
 
 @dataclass(frozen=True)
@@ -234,9 +238,7 @@ def parse_file(path: str | Path, *, max_moov_bytes: int = 32 * 1024 * 1024) -> B
     return BmffReport(path, tracks, names, tuple(problems))
 
 
-# DOVI configuration record 的两种 box 名。`dvcC` 是 Apple/HLS 规范名，
-# `dvvC` 是 ffmpeg 实际写下的俗名（ffprobe 两者都读，tvOS 只认前者）。
-DV_BOX_NAMES = ("dvcC", "dvvC")
+# DOVI configuration record 的两种 box 名，集中定义在 dvprofile。
 
 
 @dataclass(frozen=True)
@@ -350,12 +352,6 @@ def _sample_entry(trak: Box, data: bytes) -> tuple[str | None, tuple[str, ...]]:
     entry = stsd.children[0]
     return entry.type, tuple(c.type for c in entry.children)
 
-
-def _payload(trak: Box, data: bytes, name: str) -> bytes | None:
-    found = next(iter(trak.find_all(name)), None)
-    if found is None:
-        return None
-    return data[found.offset + 8 : found.offset + found.size]
 
 
 @dataclass(frozen=True)
@@ -800,6 +796,81 @@ def keep_single_sample_entry(data: bytes, keep_index: int = 0) -> tuple[bytes, i
     return bytes(buf), len(victims)
 
 
+def expected_dv_level(width: int, height: int) -> int:
+    """分辨率 → Dolby Vision level 档位。
+
+    2026-10-02 实测口径：Apple 官方 1080p P5 参考流 dv_level=3；两个点亮版
+    4K 包 dv_level=6；dv_level=9 是 8K 档。Jellyfin 有 4K 片源在 dvcC 里签
+    9，原样带进 init 后 tvOS 不按 DV 源处理（徽标不亮、颜色也不对）。
+    """
+    if height <= 1080:
+        return 3
+    if height <= 2160:
+        return 6
+    return 9
+
+
+def clamp_dvcC_level(data: bytes, level: int) -> tuple[bytes, int | None]:
+    """dvcC 的 dv_level 高于档位时压到档位，返回 (bytes, 原值 or None)。
+
+    只降不升：源签得比分辨率档位还保守时不动，不把能力签高。dvcC 无校验和，
+    改 dv_level 所在字节即可；定位走 locate_dv_boxes 的绝对偏移。
+
+    dvcC 位域（2026-10-02 用三个样本互证标定）：payload[2] 高 7 位是
+    dv_profile、低 1 位是 rpu_present_flag；payload[3] 高 5 位是 dv_level、
+    低 3 位是 el/bl 等存在位。实测 0x4d→9（不亮版）、0x35→6（点亮版）、
+    0x1d→3（Apple 1080p 官方参考流），一律 level<<3 | flags。
+    """
+    for box in locate_dv_boxes(data):
+        if box.fourcc != "dvcC" or len(box.payload) < 4:
+            continue
+        current = box.payload[3] >> 3
+        if current <= level:
+            return data, None
+        buf = bytearray(data)
+        buf[box.payload_offset + 3] = (level << 3) | (box.payload[3] & 0x07)
+        return bytes(buf), current
+    return data, None
+
+
+def clear_compressor_name(data: bytes, fourcc: str = "dvh1") -> tuple[bytes, str | None]:
+    """清空 sample entry 的 compressor 名称字段，返回 (bytes, 原名 or None)。
+
+    VisualSampleEntry 的 compressorname 是定长 32 字节（首字节长度 + 31 字节
+    名称），落在 entry 起始 +50 处，其后是 depth(0x0018) / pre_defined(0xffff)。
+    2026-10-02 对照：点亮版 init 与 Apple 官方参考流该字段都是空，Jellyfin
+    部分片源带 "DOVI Coding"，ffmpeg 原样抄进 init。字段非空时按上述结构
+    逐项校验才清零，校验不过就 raise，不静默写坏 sample entry。
+    """
+    boxes = _scan_buffer(data)
+    moov = next(((off, size) for name, off, size in boxes if name == "moov"), None)
+    if moov is None:
+        return data, None
+    moov_offset, moov_size = moov
+    buf = bytes(data[moov_offset : moov_offset + moov_size])
+    parsed = _parse_box(buf, 0, len(buf), 1)
+    if parsed is None:
+        return data, None
+    for entry in parsed.find_all(fourcc):
+        field = moov_offset + entry.offset + 50
+        length = data[field]
+        if length == 0:
+            continue
+        if not 1 <= length <= 31:
+            raise ValueError(f"{fourcc} compressor 长度字节可疑：{length}")
+        name = data[field + 1 : field + 1 + length]
+        if not all(32 <= b < 127 for b in name):
+            raise ValueError(f"{fourcc} compressor 名称不可打印：{name!r}")
+        if data[field + 32 : field + 34] != b"\x00\x18":
+            raise ValueError(f"{fourcc} compressor 字段后不是 depth，定位可疑")
+        if data[field + 34 : field + 36] != b"\xff\xff":
+            raise ValueError(f"{fourcc} compressor 字段后不是 pre_defined，定位可疑")
+        out = bytearray(data)
+        out[field : field + 32] = b"\x00" * 32
+        return bytes(out), name.decode("ascii")
+    return data, None
+
+
 def atomic_write(path: Path, data: bytes) -> None:
     """fix-up 写盘走原子替换：同目录临时文件 → fsync → os.replace。
 
@@ -814,3 +885,167 @@ def atomic_write(path: Path, data: bytes) -> None:
         handle.flush()
         os.fsync(handle.fileno())
     os.replace(tmp, path)
+
+
+# --------------------------------------------------------------------------
+# sidx 归一化（2026-10-03《纽伦堡》ab476f22 现场）
+#
+# MKV 源（视频 + DTS-HD + 5 条 PGSSUB）走完 ffmpeg HLS fMP4 muxer 后，每个
+# 分片的第一个 sidx box 的 reference_ID 与 timescale 是未初始化内存值：
+# 实测 ref_id∈{0,1,2,3…}（视频轨应为 1）、timescale∈{0, 519984, 578016, …}
+# （应为 init 视频轨的 16000，含 0 → 段时长除零），1437/1437 段全坏，无一
+# 例外。对照组：mp4 源（097c703b / ff951e2e）300+ 段 ref_id/timescale 全对
+# ——坏包 100% 坏、能播包 100% 好，这是唯一的包间结构性差异。sidx 的
+# earliest / duration 本身是对的（音频 sidx 交叉验证一致），所以原地覆写
+# 这 8 个字节即可，零重编码、零磁盘新增。真机症状：AVPlayer 解析完
+# master/video.m3u8 后一个分片都不请求，"无法播放"。
+#
+# fMP4 HLS 的 sidx#1 约定是视频轨：Apple 官方参考流与本机 ffmpeg 9.0.2
+# 原生参照包同构（sidx#1 ref_id=视频轨、first_offset=52；sidx#2 ref_id=音频
+# 轨、first_offset=0）。这里只认第一个 sidx，且只在该值明显不是音频轨时
+# 才覆写——顺序颠倒或无 sidx 的段一律跳过并计入异常，绝不错伤。
+# --------------------------------------------------------------------------
+
+_SIDX_HEAD_BYTES = 256  # styp(24) + sidx(52) + sidx(52) = 128，读 256 足够且不碰 mdat
+
+
+def init_video_track(init_path: str | Path) -> tuple[int, int]:
+    """init 段视频轨的 (track_ID, mdhd timescale)。
+
+    track_ID 取自 tkhd（payload+20 于 version 1、+12 于 version 0），
+    timescale 取自同轨 mdhd（偏移规则相同）。找不到视频轨就抛
+    ValueError——sidx 归一的参照值错了，整包每个分片都会跟着错。
+    """
+    data = Path(init_path).read_bytes()
+    video_id = None
+    video_ts = None
+    for off, btype, size, hdr in _iter_box_offsets(data, 0, len(data)):
+        if btype != b"moov":
+            continue
+        for trak_off, trak_type, trak_size, trak_hdr in _iter_box_offsets(
+                data, off + hdr, off + size):
+            if trak_type != b"trak":
+                continue
+            handler = None
+            track_id = None
+            timescale = None
+            for child_off, child_type, child_size, child_hdr in _iter_box_offsets(
+                    data, trak_off + trak_hdr, trak_off + trak_size):
+                if child_type == b"tkhd":
+                    body = child_off + child_hdr
+                    version = data[body]
+                    skip = 20 if version == 1 else 12
+                    track_id = int.from_bytes(data[body + skip:body + skip + 4], "big")
+                elif child_type == b"mdia":
+                    for mid, mtype, msize, mhdr in _iter_box_offsets(
+                            data, child_off + child_hdr, child_off + child_size):
+                        if mtype == b"hdlr":
+                            # payload = ver/flags(4) + predefined(4) + handler(4)
+                            body = mid + mhdr + 8
+                            handler = data[body:body + 4].decode("latin-1")
+                        elif mtype == b"mdhd":
+                            body = mid + mhdr
+                            version = data[body]
+                            skip = 20 if version == 1 else 12
+                            timescale = int.from_bytes(
+                                data[body + skip:body + skip + 4], "big")
+            if handler == "vide" and track_id is not None and timescale:
+                video_id, video_ts = track_id, timescale
+                break
+        if video_id is not None:
+            break
+    if video_id is None or not video_ts:
+        raise ValueError("init 段没有可用的视频轨：%s" % Path(init_path).name)
+    return video_id, video_ts
+
+
+def _iter_box_offsets(data: bytes, start: int, end: int):
+    """产出 (offset, type, size, header)——与 parpack._iter_boxes 同一口径。"""
+    i = start
+    while i + 8 <= end:
+        size = struct.unpack_from(">I", data, i)[0]
+        header = 8
+        if size == 1:
+            size = struct.unpack_from(">Q", data, i + 8)[0]
+            header = 16
+        elif size == 0:
+            size = end - i
+        if size < header or i + size > end:
+            return
+        yield i, bytes(data[i + 4:i + 8]), size, header
+        i += size
+
+
+def _segment_sidx_heads(path: str | Path) -> list[tuple[int, int, int, int]]:
+    """分片头部每个 sidx 的 (payload_off, ref_id, timescale, size)。
+
+    只读前 _SIDX_HEAD_BYTES 字节，绝不碰 mdat——1000+ 段的全片包里这是
+    O(段数×256B) 的读放大，而不是 O(整包)。
+    """
+    with open(path, "rb") as handle:
+        head = handle.read(_SIDX_HEAD_BYTES)
+    heads = []
+    for off, btype, size, hdr in _iter_box_offsets(head, 0, len(head)):
+        if btype != b"sidx":
+            continue
+        payload = off + hdr
+        version = head[payload]
+        if size != 52 or version != 1:
+            raise ValueError(
+                f"{Path(path).name}: sidx size={size} version={version}，"
+                "本归一化只支持 size=52/version=1")
+        heads.append((payload,
+                     int.from_bytes(head[payload + 4:payload + 8], "big"),
+                     int.from_bytes(head[payload + 8:payload + 12], "big"),
+                     size))
+    return heads
+
+
+def normalize_sidx(segments, init_path) -> tuple[int, list[str]]:
+    """把每段第一个 sidx 的 reference_ID/timescale 覆写成 init 视频轨真值。
+
+    返回 (修复段数, 异常说明)。幂等：本来就是对的分片直接跳过，无写盘。
+    """
+    video_id, video_ts = init_video_track(init_path)
+    fixed = 0
+    anomalies: list[str] = []
+    for seg in segments:
+        heads = _segment_sidx_heads(seg)
+        if not heads:
+            anomalies.append(f"{Path(seg).name}: 无 sidx")
+            continue
+        first = heads[0]
+        if len(heads) >= 2 and (first[1], first[2]) == (heads[1][1], heads[1][2]):
+            anomalies.append(f"{Path(seg).name}: 前两个 sidx 完全相同，放弃")
+            continue
+        payload_off, ref_id, timescale, _size = first
+        if ref_id == video_id and timescale == video_ts:
+            continue
+        with open(seg, "r+b") as handle:
+            handle.seek(payload_off + 4)
+            handle.write(struct.pack(">I", video_id))
+            handle.seek(payload_off + 8)
+            handle.write(struct.pack(">I", video_ts))
+        fixed += 1
+    return fixed, anomalies
+
+
+def verify_sidx(segments, init_path) -> None:
+    """发布前守门：任一段第一个 sidx 与 init 视频轨对不上就抛 ValueError。"""
+    video_id, video_ts = init_video_track(init_path)
+    bad = []
+    for seg in segments:
+        heads = _segment_sidx_heads(seg)
+        if not heads:
+            bad.append(f"{Path(seg).name}: 无 sidx")
+            continue
+        ref_id, timescale = heads[0][1], heads[0][2]
+        if ref_id != video_id or timescale != video_ts:
+            bad.append(f"{Path(seg).name}: ref_id={ref_id} timescale={timescale}")
+        if len(bad) >= 5:
+            break
+    if bad:
+        raise ValueError(
+            "sidx 与 init 视频轨不一致（%d+ 处）：%s；期望 ref_id=%d "
+            "timescale=%d。tvOS 会解析完播放列表后一个分片都不请求"
+            % (len(bad), "; ".join(bad[:5]), video_id, video_ts))

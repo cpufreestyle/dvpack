@@ -608,3 +608,135 @@ def test_single_entry_then_drop_sei_matches_playable_template(tmp_path: Path) ->
     report = parse_file(tmp_path / "init.mp4")
     assert report.video.sample_entry_type == "dvh1"
     assert sample_entry_count(out) == 1
+
+
+# --------------------------------------------------------------------------
+# sidx 归一（2026-10-03《纽伦堡》ab476f22：MKV 源让 ffmpeg movenc 把每段
+# 第一个 sidx 的 reference_ID/timescale 写成未初始化内存值，1437/1437 段
+# 全坏，tvOS「无法播放」）。合成样本按 ISO/IEC 14496-12 真实字段布局写。
+# --------------------------------------------------------------------------
+
+
+def _trak_box(handler: str, track_id: int, timescale: int) -> bytes:
+    tkhd = _full_box("tkhd", b"".join([
+        (0).to_bytes(4, "big"),                        # creation_time
+        (0).to_bytes(4, "big"),                        # modification_time
+        track_id.to_bytes(4, "big"),                   # track_ID
+        (0).to_bytes(4, "big"),                        # reserved
+        (0).to_bytes(4, "big"),                        # duration
+        (0).to_bytes(8, "big"),                        # reserved[2]
+        (0).to_bytes(2, "big"),                        # layer
+        (0).to_bytes(2, "big"),                        # alternate_group
+        (0).to_bytes(2, "big"),                        # volume
+        (0).to_bytes(2, "big"),                        # reserved
+        bytes(36),                                     # matrix[9]
+        (0).to_bytes(4, "big") + (0).to_bytes(4, "big"),  # width/height
+    ]))
+    mdhd = _full_box("mdhd", b"".join([
+        (0).to_bytes(4, "big"),                        # creation_time
+        (0).to_bytes(4, "big"),                        # modification_time
+        timescale.to_bytes(4, "big"),                  # timescale
+        (0).to_bytes(4, "big"),                        # duration
+        (0).to_bytes(2, "big"),                        # language
+        (0).to_bytes(2, "big"),                        # pre_defined
+    ]))
+    # handler_type 在 payload+8：ver/flags(4) + predefined(4) + handler(4)
+    hdlr = _full_box("hdlr", b"".join([
+        (0).to_bytes(4, "big"),                        # pre_defined
+        handler.encode("latin-1"),                     # handler_type
+        bytes(12),                                     # reserved[3]
+        b"dvpack\x00",                                 # name
+    ]))
+    mdia = _box("mdia", mdhd + hdlr + _box("minf", b""))
+    return _box("trak", tkhd + mdia)
+
+
+def _sidx_box(ref_id: int, timescale: int, earliest: int, first_offset: int) -> bytes:
+    one_ref = b"".join([
+        (1024).to_bytes(4, "big"),                     # referenced_size
+        (90000).to_bytes(4, "big"),                    # subsegment_duration
+        b"\x80\x00\x00\x00",                          # starts_with_SAP=1
+    ])
+    payload = b"".join([
+        ref_id.to_bytes(4, "big"),
+        timescale.to_bytes(4, "big"),
+        earliest.to_bytes(8, "big"),                   # v1 earliest
+        first_offset.to_bytes(8, "big"),               # first_offset
+        (0).to_bytes(2, "big") + (1).to_bytes(2, "big"),  # reserved+count
+        one_ref,
+    ])
+    return _full_box("sidx", payload, b"\x01\x00\x00\x00")
+
+
+def _init_two_tracks(tmp_path: Path) -> Path:
+    moov = _box("moov", _box("mvhd", bytes(100))
+                + _trak_box("vide", 1, 16000)
+                + _trak_box("soun", 2, 48000))
+    path = tmp_path / "init.mp4"
+    path.write_bytes(_box("ftyp", b"iso6iso6mp71") + moov)
+    return path
+
+
+def _segment(tmp_path: Path, name: str, video_sidx: bytes) -> Path:
+    seg = (_box("styp", b"msdhmsdhmsix") + video_sidx
+           + _sidx_box(2, 48000, 95183872, 0)
+           + _box("moof", bytes(16)) + _box("mdat", bytes(8)))
+    path = tmp_path / name
+    path.write_bytes(seg)
+    return path
+
+
+def test_init_video_track_reads_tkhd_and_mdhd(tmp_path: Path) -> None:
+    from dvpack.bmff import init_video_track
+
+    init = _init_two_tracks(tmp_path)
+    assert init_video_track(init) == (1, 16000)
+
+
+def test_init_video_track_rejects_init_without_video(tmp_path: Path) -> None:
+    from dvpack.bmff import init_video_track
+
+    moov = _box("moov", _box("mvhd", bytes(100)) + _trak_box("soun", 1, 48000))
+    (tmp_path / "init.mp4").write_bytes(_box("ftyp", b"iso6iso6mp71") + moov)
+    with pytest.raises(ValueError, match="视频轨"):
+        init_video_track(tmp_path / "init.mp4")
+
+
+def test_normalize_sidx_repairs_garbage_reference_and_timescale(tmp_path: Path) -> None:
+    """坏值（ref_id=0 / timescale=0，即除零）→ 覆写成 init 视频轨真值。"""
+    from dvpack.bmff import _segment_sidx_heads, normalize_sidx, verify_sidx
+
+    init = _init_two_tracks(tmp_path)
+    seg = _segment(tmp_path, "video0.m4s", _sidx_box(0, 0, 31727670, 52))
+    assert _segment_sidx_heads(seg)[0][1:3] == (0, 0)
+    with pytest.raises(ValueError, match="sidx 与 init 视频轨不一致"):
+        verify_sidx([seg], init)
+
+    fixed, anomalies = normalize_sidx([seg], init)
+    assert fixed == 1 and anomalies == []
+    assert _segment_sidx_heads(seg)[0][1:3] == (1, 16000)
+    audio = _segment_sidx_heads(seg)[1]
+    assert audio[1:3] == (2, 48000)
+    verify_sidx([seg], init)
+
+
+def test_normalize_sidx_is_idempotent_on_correct_sidx(tmp_path: Path) -> None:
+    """本来就对的分片直接跳过，无写盘。"""
+    from dvpack.bmff import normalize_sidx
+
+    init = _init_two_tracks(tmp_path)
+    seg = _segment(tmp_path, "video0.m4s", _sidx_box(1, 16000, 31727670, 52))
+    before = seg.stat().st_mtime_ns
+    assert normalize_sidx([seg], init) == (0, [])
+    assert seg.stat().st_mtime_ns == before
+
+
+def test_normalize_sidx_skips_segments_without_sidx(tmp_path: Path) -> None:
+    """无 sidx 的段不碰，只记账由守门处理。"""
+    from dvpack.bmff import normalize_sidx
+
+    init = _init_two_tracks(tmp_path)
+    seg = tmp_path / "video0.m4s"
+    seg.write_bytes(_box("styp", b"msdhmsdhmsix") + _box("moof", bytes(8)))
+    fixed, anomalies = normalize_sidx([seg], init)
+    assert fixed == 0 and anomalies == ["video0.m4s: 无 sidx"]

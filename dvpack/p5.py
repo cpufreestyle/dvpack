@@ -25,6 +25,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
+from .dvprofile import DV_BOX_CANONICAL, DV_BOX_NAMES
 from .bmff import DvBox, atomic_write, insert_box_after, locate_dv_boxes
 from .probe import DoviRecord
 
@@ -189,8 +190,8 @@ def resign_init_segment(
     after = after_config.to_dovi_record()
 
     patched = bytearray(data)
-    if box.fourcc != "dvcC":
-        patched[box.file_offset + 4 : box.file_offset + 8] = b"dvcC"
+    if box.fourcc != DV_BOX_CANONICAL:
+        patched[box.file_offset + 4 : box.file_offset + 8] = DV_BOX_CANONICAL.encode()
     # 长度不变：只改签名与 profile/level/compat 字段，外面的 box 尺寸都不用重算
     start = box.payload_offset
     patched[start : start + len(after_config.encode())] = after_config.encode()
@@ -202,7 +203,7 @@ def resign_init_segment(
         box_fourcc=box.fourcc,
         before=before,
         after=after,
-        renamed=box.fourcc != "dvcC",
+        renamed=box.fourcc != DV_BOX_CANONICAL,
     )
 
 

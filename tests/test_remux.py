@@ -26,6 +26,7 @@ from dvpack.remux import (
     remux,
     remux_and_verify,
     resolve_output,
+    setts_bsf,
     source_full_range,
 )
 from dvpack.tools import FFMPEG
@@ -52,6 +53,75 @@ def test_video_only_mapping_is_explicit():
     argv = hls_command(Path("in.mkv"), Path("v.m3u8"))
     assert argv.count("0:v:0") == 1
     assert not any("0:s" in arg for arg in argv)
+
+
+# ── 真机「黑屏卡住」与「没声音」的回归闸（2026-09-27）──────────────────────
+# 两个独立根因，都在这里锁住：
+#   1. 时间轴：源 DTS 非单调 + `-c copy` → 末段切成 3 帧残片（EXTINF:0.06，
+#      TARGETDURATION 却是 6）且片内 DTS 乱序（60.060→60.220→60.140）。
+#      AVPlayer 停在无法呈现的缓冲区 = 黑屏、不再发请求（分片全 200）。
+#   2. 声音：默认 maps 曾只取 0:v:0，产出**完全没有音轨**。
+
+
+def test_setts_bsf_shifts_only():
+    """setts 只平移时间戳、不重排帧：2026-09-27 A/B 实测，
+    time_base=1/fps:ts=N:duration=1 会把 60s 输入退化成 1 个 100MB+ 分片；
+    PTS-STARTPTS/DTS-STARTDTS 保留真实帧间隔（11 片）且归零成严格单调。"""
+
+    class _V:
+        frame_rate = 50.0
+
+    class _S:
+        video = _V()
+
+    assert setts_bsf(_S()) == "setts=pts=PTS-STARTPTS:dts=DTS-STARTDTS"
+
+
+def test_setts_bsf_frame_rate_irrelevant():
+    """帧率缺失（0/None）不改变口径：移位字符串恒定，不可能出现 1/0。"""
+
+    class _V:
+        frame_rate = 0.0
+
+    class _S:
+        video = _V()
+
+    assert setts_bsf(_S()) == "setts=pts=PTS-STARTPTS:dts=DTS-STARTDTS"
+
+
+def test_default_maps_include_audio():
+    """默认必须带上音轨——纯视频轨＝电视上完全没声音。"""
+    argv = hls_command(Path("in.mkv"), Path("v.m3u8"))
+    joined = " ".join(argv)
+    assert "0:a:0?" in joined  # 带 ? ：无音轨的源也不至于让 ffmpeg 报错
+    assert "-c:a copy" in joined
+
+
+def test_setts_joins_the_single_bsf_chain():
+    """-bsf:v 只吃一条链（多个 -bsf 参数 ffmpeg 只留最后一个，实测）。
+
+    setts 必须与参数集注入/VUI 重写**合并在同一条**逗号链里，且排在最后：
+    它只改时间戳，放最后不影响前面几环对参数集与 SPS 的改写。
+    """
+    argv = hls_command(
+        Path("in.mkv"),
+        Path("v.m3u8"),
+        bsf=("hevc_mp4toannexb", "extract_extradata"),
+        setts="setts=time_base=1/50:ts=N:duration=1",
+    )
+    assert argv.count("-bsf:v") == 1
+    chain = argv[argv.index("-bsf:v") + 1]
+    parts = chain.split(",")
+    assert parts[0] == "hevc_mp4toannexb"
+    assert "extract_extradata" in parts
+    assert parts[-1].startswith("setts=")
+
+
+def test_no_setts_when_normalization_disabled():
+    """关掉规整 → 链里不该出现 setts（用于复现旧行为，不是默认路径）。"""
+    argv = hls_command(Path("in.mkv"), Path("v.m3u8"), bsf=("extract_extradata",))
+    chain = argv[argv.index("-bsf:v") + 1]
+    assert "setts" not in chain
 
 
 def test_command_writes_colr_signal_by_default():
@@ -147,6 +217,118 @@ def test_end_to_end_rpu_is_self_consistent_for_profile_5(tmp_path: Path):
     """
     _, output = remux(SRC, tmp_path, seconds=6, segment_seconds=2)
     assert check_rpu_consistency(output) == ()
+
+
+@needs_source
+def test_end_to_end_output_carries_audio(tmp_path: Path):
+    """端到端：产物里必须有音轨。真机症状「有画面没声音」的直接回归闸。"""
+    import re
+    import subprocess
+
+    _, output = remux(SRC, tmp_path, seconds=6, segment_seconds=2)
+    probe = FFMPEG.parent / "ffprobe"
+    out = subprocess.run(
+        [str(probe), "-v", "error", "-show_entries", "stream=codec_type",
+         "-of", "csv=p=0", str(output.playlist)],
+        capture_output=True, text=True,
+    )
+    assert "audio" in out.stdout, out.stdout + out.stderr
+
+
+@needs_source
+def test_end_to_end_no_stub_tail_segment(tmp_path: Path):
+    """端到端：不许出现「几帧的残尾段」。
+
+    真机黑屏的形态就是末段 EXTINF:0.060000（3 帧）而 TARGETDURATION=6——
+    AVPlayer 拿到这种片会停在一个无法呈现的缓冲区上，黑屏且不再发请求。
+    两道防线：setts 把时间戳规整成 CFR，trim_stub_tail 再把过短的片尾摘掉。
+    """
+    import re
+
+    _, output = remux(SRC, tmp_path, seconds=6, segment_seconds=2)
+    durations = [
+        float(m)
+        for m in re.findall(r"#EXTINF:([\d.]+)", output.playlist.read_text())
+    ]
+    assert durations, "列表里没有 EXTINF"
+    assert min(durations) > 0.5, f"出现残尾分片：{durations}"
+
+
+@needs_source
+def test_end_to_end_timestamps_are_monotonic(tmp_path: Path):
+    """端到端：视频时间戳必须单调递增——这是黑屏最直接的根因。
+
+    修复前实测同一源非单调对数 1471/3003（末段 60.060→60.220→60.140 乱序）。
+    没有 setts 时 `-c copy` 会把源的乱序 DTS 原样搬进分片，AVPlayer 随即停播。
+    """
+    import subprocess
+
+    _, output = remux(SRC, tmp_path, seconds=6, segment_seconds=2)
+    probe = FFMPEG.parent / "ffprobe"
+    out = subprocess.run(
+        [str(probe), "-v", "error", "-select_streams", "v",
+         "-show_entries", "packet=pts_time", "-of", "csv=p=0",
+         str(output.playlist)],
+        capture_output=True, text=True,
+    )
+    stamps = [float(x) for x in out.stdout.split() if x.strip()]
+    assert len(stamps) > 10, f"没读到视频包：{out.stderr}"
+    bad = [i for i, (a, b) in enumerate(zip(stamps, stamps[1:])) if b <= a]
+    assert not bad, f"{len(bad)} 处时间戳非单调，首处在第 {bad[0]} 个包"
+    assert stamps[0] == pytest.approx(0.0, abs=0.04), stamps[0]
+
+
+def test_trim_stub_tail_drops_short_trailing_segments(tmp_path: Path):
+    """trim_stub_tail：只从尾部删过短分片，且真删文件、重写列表。"""
+    from dvpack.remux import RemuxOutput, trim_stub_tail
+
+    segs = []
+    for i, dur in enumerate((5.0, 5.0, 5.0, 0.06)):
+        p = tmp_path / f"s{i}.m4s"
+        p.write_bytes(b"x")
+        segs.append(p)
+    pl = tmp_path / "v.m3u8"
+    pl.write_text(
+        "#EXTM3U\n#EXT-X-MAP:URI=\"init.mp4\"\n"
+        + "".join(f"#EXTINF:{d},\ns{i}.m4s\n" for i, d in enumerate((5.0, 5.0, 5.0, 0.06)))
+        + "#EXT-X-ENDLIST\n"
+    )
+    out = trim_stub_tail(RemuxOutput(pl, tmp_path / "init.mp4", tuple(segs)))
+    text = pl.read_text()
+    assert "s3.m4s" not in text, text
+    assert not segs[3].exists(), "残尾分片文件应被删除"
+    assert len(out.segments) == 3
+    assert all(s.exists() for s in out.segments)
+
+
+def test_trim_stub_tail_keeps_first_segment_even_if_short(tmp_path: Path):
+    """保底：只有一段时绝不删空——空列表比残尾更糟。"""
+    from dvpack.remux import RemuxOutput, trim_stub_tail
+
+    p = tmp_path / "s0.m4s"
+    p.write_bytes(b"x")
+    pl = tmp_path / "v.m3u8"
+    pl.write_text("#EXTM3U\n#EXTINF:0.06,\ns0.m4s\n#EXT-X-ENDLIST\n")
+    out = trim_stub_tail(RemuxOutput(pl, tmp_path / "init.mp4", (p,)))
+    assert len(out.segments) == 1
+    assert p.exists()
+
+
+def test_trim_stub_tail_is_noop_when_all_segments_are_long(tmp_path: Path):
+    """没有短片尾时原样返回，列表与文件都不该被动。"""
+    from dvpack.remux import RemuxOutput, trim_stub_tail
+
+    segs = []
+    for i in range(2):
+        p = tmp_path / f"s{i}.m4s"
+        p.write_bytes(b"x")
+        segs.append(p)
+    pl = tmp_path / "v.m3u8"
+    body = "#EXTM3U\n#EXTINF:5.0,\ns0.m4s\n#EXTINF:5.0,\ns1.m4s\n#EXT-X-ENDLIST\n"
+    pl.write_text(body)
+    out = trim_stub_tail(RemuxOutput(pl, tmp_path / "init.mp4", tuple(segs)))
+    assert pl.read_text() == body
+    assert len(out.segments) == 2
 
 
 _P7_SRC = Path(os.environ.get("DVPACK_SOURCE_P7_MKV", ""))
@@ -268,14 +450,15 @@ def _mk_source(color_range: str, format_name: str = "matroska,webm") -> SourceIn
     )
 
 
-def test_dv_sps_vui_bsf_follows_source_range():
-    """range 位随源；颜色三件套恒为 9/16/9，兼容常量保 limited。
+def test_dv_sps_vui_bsf_constant_limited():
+    """range 位恒 limited：DV P5 的 BL 按 Dolby 规范就是 limited，
+    2026-09-27 真机实证透传容器 pc 徽标不亮，「按源推导」分支已删。
 
     scripts/p7_to_p5.py 断言 len(DV_SPS_VUI_BSF)==1（P7 BL 本就 limited），
     常量必须继续是一个元素的 tuple。
     """
     assert dv_sps_vui_bsf(1) == (
-        "hevc_metadata=video_full_range_flag=1:"
+        "hevc_metadata=video_full_range_flag=0:"
         "colour_primaries=9:transfer_characteristics=16:matrix_coefficients=9",
     )
     assert dv_sps_vui_bsf(0)[0].startswith(
@@ -285,19 +468,20 @@ def test_dv_sps_vui_bsf_follows_source_range():
     assert len(DV_SPS_VUI_BSF) == 1
 
 
-def test_source_full_range_maps_container_tokens():
-    """容器 color_range → range 位：pc/full/jpeg 全色域，其余保守 limited。"""
+def test_source_full_range_always_limited():
+    """容器 color_range 一律签 limited：P5 BL 恒 limited（点亮版口径）。"""
     for token in ("pc", "full", "jpeg", "PC"):
-        assert source_full_range(_mk_source(token)) == 1, token
+        assert source_full_range(_mk_source(token)) == 0, token
     for token in ("tv", "limited", "mpeg", "unknown", ""):
         assert source_full_range(_mk_source(token)) == 0, token
 
 
-def test_dv_signalling_bsf_derives_range_from_source():
-    """不显式给 full_range 时按源推导；MKV 链保持 annexb 化 + extradata 回填。"""
+def test_dv_signalling_bsf_constant_limited():
+    """不按源推导 range了：恒定 flag=0（P5 BL 点亮口径）；
+    MKV 链保持 annexb 化 + extradata 回填。"""
     assert dv_signalling_bsf(_mk_source("pc")) == (
         "hevc_mp4toannexb",
-        "hevc_metadata=video_full_range_flag=1:"
+        "hevc_metadata=video_full_range_flag=0:"
         "colour_primaries=9:transfer_characteristics=16:matrix_coefficients=9",
         "extract_extradata",
     )
