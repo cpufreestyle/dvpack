@@ -39,7 +39,7 @@ from .remux import (
     ffmpeg_timeout,
     require,
 )
-from .tools import probe_timeout
+from .tools import probe_timeout, robust_rmtree
 from .subs import write_subtitle_tracks
 
 
@@ -582,9 +582,9 @@ def parallel_pack(src, out_dir, *, seconds=0.0, segment_seconds=6.0,
     # AVPlayer fails instantly -- the "播放失败" symptom (handoff v24).
     # Stale segments are cleaned after publish, once the new playlist is live.
     for stale in out_dir.glob("_stage"):
-        shutil.rmtree(stale, ignore_errors=True)
+        robust_rmtree(stale)
     for stale in out_dir.glob("_part*"):
-        shutil.rmtree(stale, ignore_errors=True)
+        robust_rmtree(stale)
     # Idempotency for a second run of THIS function is preserved by wiping
     # the part dirs above: _run_part always starts from a clean _part<i>.
     total = seconds if seconds else probe_duration(src)
@@ -843,7 +843,7 @@ def parallel_pack(src, out_dir, *, seconds=0.0, segment_seconds=6.0,
     for sub in stage.glob("sub_*"):
         os.replace(str(sub), str(out_dir / sub.name))
     os.replace(str(stage / "master.m3u8"), str(out_dir / "master.m3u8"))
-    shutil.rmtree(stage, ignore_errors=True)
+    robust_rmtree(stage)
     # Now that the new playlist is live, segments left over from a shorter
     # previous pack (higher numbering than the new pack) are unreferenced
     # garbage. This is the first safe moment to remove them.
@@ -858,5 +858,5 @@ def parallel_pack(src, out_dir, *, seconds=0.0, segment_seconds=6.0,
             stale.unlink()
 
     for d in seg_dirs:
-        shutil.rmtree(d, ignore_errors=True)
+        robust_rmtree(d)
     return out_dir / "master.m3u8"

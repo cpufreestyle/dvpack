@@ -247,6 +247,36 @@ class TestRunPrewarm:
         run_prewarm(tmp_path, [self._decision(tmp_path)])
         assert seen == []
 
+    def test_online_leg_runs_outside_item_lock(self, tmp_path, monkeypatch):
+        """在线腿必须在 item 锁外跑：_online_subs_body 自己要拿同一把锁。
+
+        2026-10-18 实测：锁内同步调用 = 主线程自锁死锁（卡 7 分钟、无
+        ffmpeg、sample 显示无人持锁——持锁者就是主线程自己）。
+        """
+        self._mock_serve(monkeypatch, texts={})
+        monkeypatch.setattr(subsource, "online_enabled", lambda: True)
+        held: list = []
+
+        def probe(*a):
+            held.append(serve._pack_lock_for("i1").locked())
+            return "轨 zh+en"
+
+        monkeypatch.setattr(serve, "_online_subs_body", probe)
+        report = run_prewarm(tmp_path, [self._decision(tmp_path)])
+        assert report.ok and held == [False]
+
+    def test_online_leg_passes_enum_name(self, tmp_path, monkeypatch):
+        """在线腿直传枚举真片名：Jellyfin 新登录会踢掉旧 token 的 /Items
+        权限，_jf_item_name 反查只会 401「缺片名」（2026-10-18 实测）。"""
+        self._mock_serve(monkeypatch, texts={})
+        monkeypatch.setattr(subsource, "online_enabled", lambda: True)
+        seen: list = []
+        monkeypatch.setattr(serve, "_online_subs_body",
+                            lambda *a: seen.append(a) or "轨 zh+en")
+        report = run_prewarm(tmp_path, [self._decision(tmp_path)])
+        assert report.ok and len(seen) == 1
+        assert seen[0][4] == "测试片"
+
     def test_failure_isolated_from_batch(self, tmp_path, monkeypatch):
         """第一部抛错不能掀翻整批：后面的条目照常打包，failed 只记 1 条。"""
         self._mock_serve(monkeypatch)

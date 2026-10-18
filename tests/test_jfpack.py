@@ -11,6 +11,7 @@ import http.client
 import json
 import os
 import socket
+import time
 from pathlib import Path
 
 import pytest
@@ -23,6 +24,7 @@ from dvpack.serve import (
     ID_PATTERN,
     _cache_fresh,
     _src_fingerprint,
+    _touch_active_pack,
     _valid_pack_src,
     INSTANT_PACK_SECONDS,
     WARM_PACK_SECONDS,
@@ -552,3 +554,26 @@ def test_fetch_subtitle_texts_without_item_id_returns_empty():
         SubtitleStream(index=2, codec="subrip", language="chi")
     )
     assert fetch_subtitle_texts("http://192.168.1.68:8096/other/x.mkv", source) == {}
+
+
+def test_touch_active_pack_refreshes_playlist_mtime(tmp_path: Path):
+    """在播包必须续命：LRU 按 video.m3u8 mtime 淘汰，播放只读不改 mtime，
+    不 touch 的话看了一半的包会被新打包的磁盘闸当中场误杀→404 播放失败。
+    """
+    pack = tmp_path / "_jf" / "abc123"
+    pack.mkdir(parents=True)
+    playlist = pack / "video.m3u8"
+    playlist.write_text("#EXTM3U\n", encoding="utf-8")
+    old = time.time() - 3600
+    os.utime(playlist, (old, old))
+
+    (pack / "video00001.m4s").write_bytes(b"seg")
+    _touch_active_pack(str(pack / "video00001.m4s"))
+    assert playlist.stat().st_mtime > old
+
+    stamp = playlist.stat().st_mtime
+    time.sleep(0.01)
+    # 子目录（subs/）与非 _jf 路径都不许碰
+    _touch_active_pack(str(pack / "subs" / "en.m3u8"))
+    _touch_active_pack(str(tmp_path / "plain.m3u8"))
+    assert playlist.stat().st_mtime == stamp

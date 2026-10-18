@@ -2690,3 +2690,289 @@ spawn 语义不属于它的测面（全片补包语义在 `_maybe_renew_pack` �
 
 这个项目的「脂肪」几乎全在运行时数据（2.5G 已隔离），**源码本身 9421 行没有可删的
 余量**。真要再瘦只能动 176K 的 HANDOFF.md，但那是测试依赖项，需单独评估。
+
+---
+
+## v73（2026-10-18 14:00）— subfetch 加固：条目 URL 百分号编码 + 三源崩溃隔离
+
+### 根因
+serve 日志抓到 `在线字幕 a94928a5…：未拿到：subfetch 无产出（rc=1）`，traceback
+炸在 `tools/subfetch.py:894 subcat_fetch`：
+`curl_bytes("%s%s" % (BASE, dl[langkey]))` → curl rc=3（URL 畸形）。
+条目页正则 `href="(/subs/\d+/[^"]+\.srt)"` 的 `[^"]+` 会把 .srt 文件名里的
+空格/非 ASCII 收进 href，BASE 直接拼接出畸形 URL；且 `main()` 的
+os/subhd/subcat 三源调用全无 try/except——单源崩则整进程 rc=1，
+其他语种已抓成果一起丢（该片最终零产出）。
+
+### 改动（备份 /tmp/subfetch.bak.py，未 commit）
+1. `tools/subfetch.py:894`：`BASE + urllib.parse.quote(dl[langkey])`——根因修复，
+   路径百分号编码（空格→%20、中文→UTF-8 百分号），斜杠保留。
+2. `tools/subfetch.py:493`：`entry_langs` 拼条目页 URL 同样
+   `BASE + "/" + urllib.parse.quote(href)`——同一 bug 类，未爆只因为运气。
+3. `tools/subfetch.py` main()：三源调用各自 try/except，单源异常只跳过该源该语种，
+   打印 `[os/subhd/subcat] <lang> 源异常（跳过本语种该源）`，不再炸全局。
+
+### 交接状态（有证据）
+- `.venv/bin/python -m pytest tests/test_subfetch.py -q`：47 passed；
+  test_subsource/test_subs/test_subwarm 合计 61 passed；py_compile 通过。
+- 活体端到端（detached pid 7836，`--name Nuremberg --langs en,zh`）：
+  `[en] 采用源 os:Nuremberg_(2025)` → OS 无中文 →
+  `[zh] 采用源 subhd:url`（Nuremberg.2025…中文&英语，覆盖率 1.00）。
+  auto 链 os→subhd→subcat 走通，进程正常退出。
+- 双语管线默认开（`subsource.py:72 online_enabled()`，DVPACK_SUBS_ONLINE 默认 1）；
+  在线腿由 serve 后台 worker 触发，绝不进 302 热路径。
+- 现役 serve pid 14952（:8899，root _out/dv_p7_fix）未重启；UDP 97044（8901）在役。
+
+### 下一回合候选
+- app 侧：服务器地址/登录态缺失时别再发空 src 的 /jf/pack（serve 日志 47×400，
+  192.168.1.111 三十次零 query；.100 早期 15 次），改本地报错不出网。
+- app 侧：Jellyfin 已删条目（ab476f22 上游 404 → /jf/pack 502）在片库里的
+  陈旧项清理或降级提示。
+## 2026-10-18 14:12 真机双语字幕验收：服务端通、首播竞态待修
+- 在役:serve 14952(:8899) / UDP 97044(:8901) 正常。
+- 真机播 de741a5c/bcc86238:在线腿已补齐 _jf/<id>/sub_zh.vtt+sub_en.vtt+*.m3u8(14:12),master 加 #EXT-X-MEDIA:TYPE=SUBTITLES(zh/en,SUBTITLES=subs);内容真实(zh 弗洛伊德引言 / en Dangerous rip currents),en=OpenSubtitles zh=SubHD。
+- 问题:dvplay SubtitleEngine 起播只 fetch 一次 sub_zh/sub_en(UDP 14:06:30 bytes=333 cues=0),在线 worker 约4分钟后才落真 .vtt,app 不轮询重拉导致首播该片无字幕;有缓存片(如 Nuremberg)重播正常。
+- 根因:首播竞态 = app fetch-once + 在线腿分钟级延迟。
+- 待办(待用户拍板):dvplay 字幕引擎加前几分钟轮询重拉至 cues>0(需改 Swift+重装 ATV,会中断当前播放);或先 prewarm 全库字幕进 L2 缓存(不动 app)。
+## 2026-10-18 15:30 prewarm 自锁死锁修复 + 预热重启
+### 根因
+prewarm._pack_one 在持有 serve._pack_lock_for(item_id)（不可重入锁）的 with 块内
+同步调用 serve._online_subs_body，后者为换字幕轨又要拿同一把 item 锁
+(serve.py:1221)→ 主线程自锁死锁。现场:pid 42163 存活 0% CPU、无 ffmpeg、
+sample 845/845 采样全在 lock_PyThread_acquire_lock 且无任何线程持锁——持锁者
+就是主线程自己。serve 侧不炸只因 _spawn_online_subs 起异步线程等锁释放。
+### 改动(未 commit)
+1. dvpack/prewarm.py:在线字幕腿移出 item 锁——打完包锁外同步跑,分钟级公网
+   抓取不挡下一部;serve 口径不变。
+2. tests/test_prewarm.py 新增 test_online_leg_runs_outside_item_lock:探针记录
+   _pack_lock_for("i1").locked(),锁外必须 False。旧代码实测 FAIL,新代码过。
+### 验证
+- pytest 四套件(jfpack/jfpack_subtitles/serve/prewarm):168 passed, 5 skipped。
+- kill 42163 无 ._upgrade_* 残留;重启 prewarm pid 49265(/tmp/launch_prewarm.py,
+  日志 /tmp/dvpack-prewarm.log,flush 行缓冲生效):进度 1/60,首包 S05E03
+  5.4G/178s,在线腿锁外跑完未卡死。
+- 在线腿首包报"缺片名"(_jf_item_name→/Items 401 瞬时,手工复现同链路 200,
+  次包复查中);若复发:prewarm 把登录 token 直传 _online_subs_body,不靠
+  token_from_src 从 src 反解。
+### 库情纠正
+17d9c6be 不是《亚兹拉尔》而是《风味人间》S05 某集(上轮误标);库内 S03/S04/S05
+数十集标签截断后同名。17d9c6be=已缓存命中,18a33ef0=在打。
+### 下一回合候选
+- 磁盘闸 24G(重启时 79G free):预计再 8-10 包后自动跳剩余,出预热带战报
+  (打包 N/命中/跳过/失败、总 GB、用时)。
+- 预热带跑完后 jobs 可评估 2 提速(硬顶内)。
+## 2026-10-18 15:40 在线字幕 token 401 修复(name 直传)+回归测试+负缓存清理+预热重启(v11)
+### 根因
+在线腿「缺片名」不是瞬时抖动:Jellyfin 任何一次新登录都会把旧 token 的
+/Items 权限踢掉(实测 T1 fresh 200 → 同设备再登录 T1 401 → 换 DeviceId 再
+登录 T1 仍 401;拉流不受影响)。prewarm/serve 每次重启登录 = 废掉 ATV app
+token 的 /Items → _jf_item_name 反查必 401 → 在线腿空转还毒化负缓存。
+### 改动(未 commit)
+1. dvpack/serve.py:_online_subs_body 加 name: str = "" 参数,空名才走反查;
+   docstring 记 401 根因。
+2. dvpack/prewarm.py:调用处直传 item.name(枚举真名),附根因注释。
+3. tests/test_serve.py 新增 test_online_subs_body_uses_passed_name_without_lookup:
+   直传名时 fetch_online_texts 收到 name=="真片名",_jf_item_name 不被调用
+   (monkeypatch 成抛 AssertionError 验证)。
+4. tests/test_prewarm.py 新增 test_online_leg_passes_enum_name:捕到
+   _online_subs_body 第 5 个位置参数 == item.name("测试片")。
+5. HANDOFF.md:删掉上轮误重复追加的 15:30 段(2737-2763,两份 diff 一致)。
+### 验证
+- pytest 四套件:170 passed, 5 skipped(name 补丁前 168)。
+- 清毒化负缓存:_out/dv_p7_fix/_subs/*/meta.json 扫出 4 个 reason=缺片名
+  (1e732e98/370b6241/3d2d897a/50938adc),subsource.clear_online_failure
+  清掉(脚本 /tmp/clear_poisoned_negcache.py);复扫 total 0。注意旧进程
+  kill 前最后一部包的在线腿会复毒化一次,kill 后复清即可。
+- kill 49265(旧代码,第 5 部 S03E05 损失可接受);重启 pid 56057(新登录
+  token 68dbdae9…,片库 71 条,计划 55 部)。
+- 活体验收通过:56057 首包 S03E07 在线腿回执从「未拿到:缺片名」变成
+  「轨 en(subfetch rc=0 en)」——真抓取,401 空转消失。
+### 遗留(下一回合候选)
+- serve 侧在线腿仍走 _jf_item_name 反查(src 里的 ATV token 会被任何新登录
+  踢掉 /Items):prewarm 每次重启登录都会废掉当时 ATV 的在线字幕。候选修法:
+  a) dvplay /jf/pack URL 带 &name= 真片名、serve 直传(最稳、零 API 依赖,
+     要改 Swift app 重装 ATV);
+  b) serve._jf_item_name 捕 401 后用 serve 自有账号重登 retry 一次(纯服务端;
+     副作用:重登会踢其他 token 的 /Items,但 prewarm 已不需要 /Items)。
+- 战报:56057 跑至磁盘闸(free<24G 自动跳剩余)或合理截断,汇总打包/命中/
+  跳过/失败、GB、用时。
+- jobs=2 提速评估(硬顶内)。
+
+---
+
+## 16:20 段：在线字幕张冠李戴（Deadpool 配风味人间）根因修复 + 毒缓存清理
+
+### 根因（实锤 /tmp/subfetch_diag_en.log）
+- os_pick 无最低分闸 + 裸 Jaccard 相似度：S03E07「Once Upon a Bite」选中
+  「Once Upon a Deadpool」(2018)，score=-0.32（负分也中）。
+- 覆盖率判据太松：correct/query 3/4=0.75，连 subhd/subcat 的 0.5 闸都能过。
+- bug 精确形态（_subs 缓存实锤）：同一 item 风味人间 S03E07，zh 抓对
+  （「出品人：孙忠怀…总导演：陈晓卿」744 cues），en 抓错（"Psst! Wakey-wakey,
+  Frosted Flakey"=Deadpool，2055 cues）。中英分腿各自选源，英文腿误配。
+
+### 修复（tools/subfetch.py，5 处；注意本文件被 .gitignore，git diff 看不到）
+1. 新增 title_coverage(name, cand)：题名词元按拉丁/CJK 拆子集，完整覆盖任一族
+   即过闸（「纽伦堡.Nuremberg…」混排不被纯英文候选误杀；半中半英垃圾过不了任一子集）。
+2. os_pick 重写：cov=title_coverage(...)，cov<1.0 直接出局；score 改
+   cov + min(0.2, similarity) - ypen + hi/trusted/dl 微调；新增季集加权
+   （同集 +0.2 / 错集 -0.3，对齐另两腿）。
+3. core_tokens 增加丢弃纯符号词元（& vs and 写法不一致，否则
+   「Deadpool & Wolverine」对「Deadpool and Wolverine」只有 2/3）。
+4. subhd_fetch / subcat_fetch 闸从 core_coverage<0.5 收紧为 title_coverage<1.0
+   （同一个洞）。
+5. 门验证：Deadpool 0.75 拒、正确 release 1.0 过、纽伦堡混排 1.0 不误杀、&/and 1.0。
+
+### 回归测试（tests/test_subfetch.py +9 → 56 passed）
+- TestTitleCoverage(4) + TestOsPickGate(3：拒错片/收正确片/错集排序) +
+  test_subhd_fetch_rejects_wrong_movie + test_fallback_rejects_partial_coverage_wrong_movie。
+- 复跑确认：pytest tests/test_subfetch.py 56 passed。
+- 全量 pytest：8 failed 全是 tests/test_jfpack.py 的 507 磁盘不足
+  （真实 23Gi free < serve 预留 24G，磁盘保护正常触发，与本次无关；test_jfpack 不 import subfetch）。
+
+### 毒缓存清理（已闭环，/tmp/dvpack_poison_clean.py，全 python 原子 unlink）
+- 关键机制确认：subsource.load_cached_texts 命中判据只看 <lang>.vtt 文件存在且非空，
+  完全不看 meta.cues → 删 .vtt 文件即触发未来重抓；成功缓存 source=online 无 TTL、
+  无 failed_at，不受 6h 负缓存阻挡，重抓立即生效。subsource.fetch_online_texts 是
+  子进程跑 tools/subfetch.py → 修复对新抓取即时生效，不用重启 prewarm。
+- _subs 删 4 个毒 en.vtt(133912B)：27e14e96/4d9ff282/69bc321d/702e0ffe；
+  meta.cues.en 同步清；69bc 保留正确 zh（风味人间 744 cues）。
+- _jf pack 删已发布毒英轨 sub_en.vtt/sub_en.m3u8/sub_en.cat.vtt：41a243b8/63f12d3d/47a0c317；
+  master.m3u8 去掉 #EXT-X-MEDIA:SUBTITLES 行 + STREAM-INF 去 ,SUBTITLES="subs"（391B→258B）。
+  17d9c6be 仅删中间产物 sub_en.cat.vtt（其 master 本无 SUBTITLES）。
+- 全库复扫 deadpool 关键词（_subs 15 个 vtt + _jf 27 个 sub_*.vtt）：residual=0。
+- serve 即时生效（每请求读 master.m3u8 文件，无需重启）：HTTP GET master 已吐无 SUBTITLES 版，
+  VIDEO-RANGE=PQ + SUPPLEMENTAL-CODECS="dvh1.05.06/db1p" 完整保留 → DV 徽标不受影响。
+
+### prewarm 战报（56057 已完成）
+- 55/55：打包 6 / 命中 16 / 跳过 49（磁盘 free<24G 自动跳）/ 失败 0，用时 1349s。
+- 在线腿回执从「未拿到:缺片名」变「轨 en(subfetch rc=0 en)」——真抓取，401 空转消失。
+
+### 遗留（下一回合候选）
+- 41a243b8/63f12d3d/47a0c317 三个 pack 现无英文字幕轨（已去毒）。要补「正确的双语字幕」：
+  磁盘宽裕后删这三个 master.m3u8 → serve._pack_playable 判失效 → 重打包时 subsource
+  重新抓（_subs 毒缓存已清、闸已修）→ 生成对的 sub_en.vtt + 带 SUBTITLES 的 master。
+  现磁盘 23Gi<24G reserve，重打包会被 serve 磁盘闸挡下返回 502，故本轮只止损不触发。
+  候选：a) 用户确认清理 _out 旧包腾 >24G 后重打这 3 部；b) 临时调低 DISK_RESERVE_BYTES。
+- serve 侧在线腿 _jf_item_name 401 反查的两个修法仍候选（dvplay &name= / serve 重登 retry），见 15:30 段。
+
+### 字幕重抓诊断结论 + 用户终裁（17:0x，第二阶段关闭）
+- 诊断实锤（/tmp/dvpack_os_raw.out、/tmp/dvpack_subhd_probe.out、/tmp/dvpack_probe_names.out）：
+  OS 对 Once Upon a Bite 的 49 个候选全是 Once Upon a Time/Deadpool 等 fuzzy 错片，
+  zh 0 命中，带 S03E07 查询 0 命中——OS 库真没有《风味人间》字幕，新闸拒得对，非 bug。
+  SubHD 仅 1 条：sid=GkX2BU「风味人间（1-4集）Once.Upon.A.Bite.Complete.2018.WEB-DL」
+  ——第 1 季资源，与 item 无季集信息对不上；subcat 检索无本片条目。
+- **用户终裁：「中文视频不需要字幕」**——《风味人间》中文配音纪录片，不补任何字幕轨。
+  三个 pack（41a243b8/47a0c317/63f12d3d）维持现终态：master 无 SUBTITLES、
+  VIDEO-RANGE=PQ + SUPPLEMENTAL-CODECS="dvh1.05.06/db1p" 完整（17:0x 复核通过）→ DV 徽标正常。
+  16:20 段「遗留」里的补双语字幕候选自此关闭，不做。
+
+### 磁盘清理（17:0x，/tmp/dvpack_lru_clean.py，serve 同口径 LRU）
+- 口径与 serve._ensure_disk_room 一致：按 video.m3u8/master.m3u8 的 max mtime 排最旧，
+  淘汰到 free>=MIN_FREE_BYTES(24Gi)；serve 在跑（:8899 http=404 正常），在播包有
+  _touch_active_pack mtime 续命，LRU 天然跳过。
+- 实删 1 个：c02435e233561f928d7f494e78a34c01（7.58Gi，idle 3.9h，全库最旧=没在播）。
+  free 20.2Gi→27.8Gi，packs 24→23。未多删：再删要牺牲用户回看命中，需要更多余量再说。
+
+---
+
+## 17:2x 段：Windows 部署移植（用户终裁：先做部署脚本，他自己在 .68 上跑）
+
+用户对「要么把这个项目直接部署到哪个电脑呢」的终裁：**不碰凭证、不远程安装，
+交付一个他能在 192.168.1.68 自己跑的部署包**。目标机侦察结论（16:5x 实测，
+勿重扫）：.68=Jellyfin 宿主、本地盘 924GiB 空闲、22/80/445 通（Docker/
+Jellyfin 停着）；.248=移动网关排除；.103 不明；Mac en0 已漂移成 .111、
+盘剩 30Gi——外移部署是正解。
+
+### 代码修复（dvpack/serve.py ×3、relay.py ×1、tools/subfetch.py ×1、tools.py 新增）
+1. serve._rename_swap 开头加 `if os.name != "darwin": raise OSError(errno.ENOSYS,...)`。
+   Windows 上 ctypes.CDLL(None).renamex_np 抛 AttributeError 而调用方只捕
+   OSError → 全片打包必崩；抛 ENOSYS 落进已有两步回落（rename→._trash_*、
+   rename tmp→out_dir），路径不断流。serve.py 加 import errno。
+2. serve._pid_alive 加 nt 分支 _pid_alive_nt：kernel32.OpenProcess(0x1000)，
+   NULL 时 GetLastError()==5(ERROR_ACCESS_DENIED) 才算活。原 os.kill(pid,0)
+   在 Windows 对死进程抛裸 OSError(WinError 87) 被「拿不准算活」吞 → 死 pid
+   回收目录白等 45 分钟 mtime 闸。
+3. tools.py 新增 robust_rmtree(path, retries=3, delay=0.4)：删不动先重试、仍失败
+   改名 ._trash_{name}_{pid}（_sweep_stale_swaps 认得该前缀、按
+   rsplit("_",1)[-1] 解析 pid，pid 死即收）。serve.py 11 处 + parpack.py 4 处
+   shutil.rmtree(ignore_errors=True) 全换。治 Windows 文件句柄占用（http.server
+   在播分片）静默留垃圾。POSIX 行为不变（unlink-while-open 照删）。
+4. relay.ffmpeg_visible_source 加 nt 旁路：直接 return src（Windows 无 TCC，
+   中继纯为绕 TCC 而生）。relay.py 加 import os；CURL 常量未动（_curl() 已有
+   which 回退）。
+5. tools/subfetch.py 新增 _curl_exe()（/usr/bin/curl 存在则用——保 macOS TCC
+   豁免语义；否则 which("curl")，Win10+ System32 自带）与 _tar_exe()
+   （/usr/bin/bsdtar 优先，回退 which bsdtar/tar——Windows tar.exe 即 bsdtar）。
+   4 处硬编码 "/usr/bin/curl" + 1 处 bsdtar 回退全换。
+
+### 二进制暂存（tools/ 已 gitignore 不进 git；随目录拷贝带去 .68）
+- tools/bin/dovi_tool.exe：dovi_tool 2.3.4 x86_64-pc-windows-msvc.zip，3,356,672B，
+  PE32+ 验过；与 Mac 同版本（P7→P5 mode 5 链已验证那版）。
+- tools/ffmpeg/bin/{ffmpeg,ffprobe}.exe：BtbN master-latest win64-gpl 各 ~169MB，
+  PE32+ 验过；bin 目录仅 3 exe 无 DLL（全静态）。
+  GitHub API 被限流（共享 IP），资产名从 releases/expanded_assets 页面端点捞：
+  2.3.4 资产名带版本号 dovi_tool-2.3.4-x86_64-pc-windows-msvc.zip。
+
+### scripts/deploy.ps1（管理员 PowerShell 一把跑）
+装 uv（astral）→ uv venv → uv pip install -e . → 补齐缺失二进制（IWR+
+Expand-Archive，按 URL 去重只下一遍）→ dvpack config --init + --os-key
+（默认 key 4kQho...qR9U）→ 建 C:\dvpack\cache → New-NetFirewallRule tcp/8899
+（非管理员打印手动命令并跳过）→ 生成 run-serve.ps1（JF env + 日志滚动追加
+logs\serve.log）+ schtasks ONLOGON 自启 dvpack-serve → 立即起一份 +
+Invoke-WebRequest 127.0.0.1:8899 自检（404=活）→ 打印全部 IPv4 给 ATV 填。
+参数 -RepoRoot/-CacheRoot/-Port/-JfBase/-JfPassword(明文警告)/-NoAutostart/
+-DisableSleep；强制短路径无空格（schtasks /TR quoting 脆）。
+
+### docs/WINDOWS-DEPLOY.md（用户运行手册）
+拷仓库到 C:\dvpack → 跑 deploy.ps1 → dvplay 改 http://192.168.1.68:8899 →
+prewarm 预热（--user root --pw）→ 日常运维（日志/重启/改端口/卸载）→ 迁移
+成功后 Mac 侧收尾（_jf 119G 清理前提：ATV 在新服务连放三部无误）。
+
+### 测试与回归
+- 新增 test_tools.TestRobustRmtree(4) + test_serve.TestWindowsCompat(4) +
+  test_relay.TestWindowsBypass(2)：monkeypatch 模拟 nt，Mac 上也能跑。
+- 全量 786 passed / 19 skipped（基线 776+10 新增零回归；19 skip 为磁盘闸
+  环境性跳过）。DV 徽标不受影响：信令链路零改，VIDEO-RANGE=PQ +
+  SUPPLEMENTAL-CODECS="dvh1.05.06/db1p" 与 master 输出逻辑未动。
+
+### 遗留（下一回合候选）
+- deploy.ps1 未在真机 Windows 验证（编写机无 PowerShell）：首次真机跑若报错
+  按行号修；重点嫌疑 schtasks /TR quoting 与 here-string 插值。
+- 用户部署后：dvplay 改地址 → ATV 连放三部验收（起播+DV 徽标+双语字幕）→
+  通过再清 Mac _jf 缓存；Mac serve/prewarm 待验收后可停（未停）。
+
+## 17:56 段：交接定稿 + 仓库同步——用户赴 .68 部署，本提交即同步产物
+
+### 仓库同步（本轮）
+- fix/lan-address 领先 origin/master 的 15 个提交 + 本提交，推送 origin/master
+  （gh 已鉴权 cpufreestyle）。远端另有一个本地从未拉取的 9251047（Windows ctypes
+  两段式修复，整文件 CRLF 翻弄）：以 merge 合入，serve.py 保 LF、只摘修复、拒行尾
+  漂移。本地 master 的 2 个独有提交（44a2d9e/d01d888）与远端 ec48b3e/60d1c86 系
+  同内容 rebased 孪生（LF 锁定 / Windows 打包链路），无内容丢失。
+- 本提交内容：Windows 兼容层修复（serve.py _rename_swap 加 nt ENOSYS 守卫、
+  _pid_alive nt 派发 kernel32 探测；tools.py robust_rmtree 新增，serve/parpack 共
+  15 处 rmtree 换装；relay.py ffmpeg_visible_source nt 旁路；tools/subfetch.py
+  _curl_exe/_tar_exe 回退 PATH）+ scripts/deploy.ps1 + docs/WINDOWS-DEPLOY.md
+  （补「严禁 git clone」）+ 3 组共 10 个 Windows 兼容单测 + 本节。全量
+  786 passed / 19 skipped（19 skip 为磁盘闸环境性跳过）。
+
+### 部署唯一正确姿势（.68，用户自己在机上跑）
+1. 整目录拷贝：\\<mac-ip>\AI Shared\repo\dvpack → C:\dvpack（短路径无空格）。
+   严禁 git clone——tools/ 整个被 gitignore：subfetch.py 丢了在线字幕整条腿静默
+   失效（兜底只管 key 解析、不抓字幕），三个 .exe 还得白下 340MB。
+2. 管理员 PowerShell：cd C:\dvpack ; powershell -ExecutionPolicy Bypass -File
+   scripts\deploy.ps1 -JfBase http://192.168.1.68:8096 -DisableSleep
+3. dvplay 地址改 http://192.168.1.68:8899 → 连放三部验收（起播 + DV 徽标 +
+   中英双语字幕）。
+4. 验收过 → Mac 侧停 serve/prewarm；清 _out/dv_p7_fix/_jf（约 119GiB）与 _subs
+   字幕缓存。路由器给 .68 做 DHCP 保留；.68 的 Docker/Jellyfin 保持常开。
+
+### DV 徽标
+照常亮：信令链路零触碰——VIDEO-RANGE=PQ + SUPPLEMENTAL-CODECS="dvh1.05.06/db1p"
+与 master 输出逻辑一行未动，本轮全在 Windows 兼容层。
+
+### 未验证（明示，勿当已过）
+- deploy.ps1 未在真机 Windows 跑过（编写机无 PowerShell）：报错就把行号发回来，
+  按行修；重点嫌疑 schtasks /TR quoting 与 here-string 插值。
+- Windows 适配代码只过单测锚定（robust_rmtree / kernel32 pid 探测 / curl+tar
+  回退），未真机。真机首跑重点盯：起播、字幕抓取、robust_rmtree 删缓存。

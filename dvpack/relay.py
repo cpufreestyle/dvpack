@@ -17,6 +17,7 @@ curl 固定 /usr/bin/curl：PATH 里的 homebrew curl 实测被同一道墙挡�
 
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 import threading
@@ -62,6 +63,10 @@ def ensure_relay() -> str:
 def ffmpeg_visible_source(src: str) -> str:
     """http(s) 片源换成中继地址；本地路径原样返回。"""
     if urlsplit(src).scheme in ("http", "https"):
+        if os.name == "nt":
+            # Windows 没有 macOS 本地网络隐私（TCC），ffmpeg 直连局域网
+            # 片源没有障碍；中继纯粹为绕 TCC 而生，直连少一跳 curl.exe。
+            return src
         # 必须带参数名：光 quote 出来的串没有 key，parse_qs 取不到 'u'，
         # 实测把每个请求都判成 400（2026-09-26 第一次接线就死在这）。
         return f"{ensure_relay()}/u?u={quote(src, safe='')}"

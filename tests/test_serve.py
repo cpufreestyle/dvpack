@@ -8,8 +8,11 @@ from __future__ import annotations
 
 import http.client
 import ipaddress
+import errno
 import json
 import os
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -360,6 +363,31 @@ def test_online_subs_body_fetches_caches_and_upgrades(tmp_path: Path, monkeypatc
     assert 'TYPE=SUBTITLES' in master and 'URI="sub_zh.m3u8"' in master
 
 
+def test_online_subs_body_uses_passed_name_without_lookup(tmp_path: Path, monkeypatch):
+    """调用方直传真片名：不再麻烦 /Items 反查（新登录会踢掉旧 token 权限）。"""
+    from dvpack import subsource
+
+    out_dir = tmp_path / "pack"
+    out_dir.mkdir()
+    _fake_pack(out_dir)
+
+    def _boom(src, item_id):
+        raise AssertionError("直传了名就不许再查 /Items")
+
+    monkeypatch.setattr(serve_module, "_jf_item_name", _boom)
+    seen: dict = {}
+
+    def _fetch(**kw):
+        seen.update(kw)
+        return (dict(_TEXTS), "subhd rc=0")
+
+    monkeypatch.setattr(subsource, "fetch_online_texts", _fetch)
+    receipt = serve_module._online_subs_body(tmp_path, _SRC, "5360", out_dir,
+                                             "真片名")
+    assert "zh+en" in receipt
+    assert seen["name"] == "真片名"
+
+
 def test_online_subs_body_skips_while_negative_cache_blocks(tmp_path: Path, monkeypatch):
     """负缓存 TTL 内直接短路：不查片名、不起子进程、不烧公网。"""
     from dvpack import subsource
@@ -501,3 +529,35 @@ class TestPackFullSwapInterrupt:
                 "http://127.0.0.1:8899/Videos/i1/stream.mkv?static=true",
                 out, [], [], "i1")
         assert not expected_tmp.exists()
+
+
+class TestWindowsCompat:
+    """Windows 部署适配三处：swap 守卫 / pid 探测 / nt 分支派发。
+
+    改坏了在 Mac 上无症状，真机症状是全片打包直接崩（AttributeError 穿透
+    OSError 守卫）或死 pid 回收目录白等 45 分钟。
+    """
+
+    def test_rename_swap_off_darwin_raises_enosys(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(serve_module.os, "name", "nt")
+        src, dst = tmp_path / "a", tmp_path / "b"
+        src.mkdir()
+        dst.mkdir()
+        with pytest.raises(OSError) as exc:
+            serve_module._rename_swap(src, dst)
+        assert exc.value.errno == errno.ENOSYS
+        assert src.is_dir() and dst.is_dir()
+
+    def test_pid_alive_true_for_self(self):
+        assert serve_module._pid_alive(os.getpid()) is True
+
+    def test_pid_alive_false_for_reaped_child(self):
+        proc = subprocess.Popen([sys.executable, "-c", "pass"])
+        proc.wait()
+        assert serve_module._pid_alive(proc.pid) is False
+
+    def test_pid_alive_dispatches_nt_helper(self, monkeypatch):
+        monkeypatch.setattr(serve_module.os, "name", "nt")
+        monkeypatch.setattr(serve_module, "_pid_alive_nt", lambda pid: pid == 4242)
+        assert serve_module._pid_alive(4242) is True
+        assert serve_module._pid_alive(os.getpid()) is False

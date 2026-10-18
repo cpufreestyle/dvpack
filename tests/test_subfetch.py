@@ -257,6 +257,17 @@ def test_subhd_fetch_moves_past_pgs_only_candidate(monkeypatch, capsys):
     assert "PGS" in capsys.readouterr().out
 
 
+def test_subhd_fetch_rejects_wrong_movie(monkeypatch):
+    """片名闸三腿共用：0.75 覆盖率的错片候选必须整条出局（Deadpool 口径）。"""
+    monkeypatch.setattr(
+        subfetch, "subhd_entries",
+        lambda q, cap=30: [("KsGPl5", "Once Upon a Deadpool 2018 简英双语")])
+    a = argparse.Namespace(name="风味人间.Once.Upon.a.Bite.S05E07.2024.2160p.mkv",
+                           subhd_sid="", subhd_url="", sub_file="")
+    assert subfetch.subhd_fetch(a, "zh", ["Once Upon a Bite S05E07"],
+                                "风味人间") is None
+
+
 # --- v51：检索词变体 + 匹配判据 + key 配置（上轮改动补测） ---
 
 def test_build_queries_variants_and_dedup():
@@ -446,6 +457,72 @@ class TestCoreCoverage:
                                       "subs/1001/Nuremberg.2025.1080p.html") == 0.0
 
 
+def _os_cand(title, release, year=2018, downloads=5000, hi=False,
+             trusted=False, file_id=1):
+    """os_search 候选字典（os_pick 入参形状，与 os_search 输出字段对齐）。"""
+    return {"file_id": file_id, "language": "en", "release": release,
+            "title": title, "year": year, "downloads": downloads,
+            "hi": hi, "trusted": trusted, "url": "", "imdb": None,
+            "tmdb": None, "fps": None}
+
+
+class TestTitleCoverage:
+    """片名闸：完整覆盖任一文字体系的题名才过（2026-10-18 Deadpool 事故）。"""
+
+    def test_deadpool_partial_latin_rejected(self):
+        # 事故复现：「Once Upon a Bite」对「Once Upon a Deadpool」拉丁子集
+        # 覆盖率 3/4=0.75——老 0.5 闸能过、负分都被选中；新闸必须拒
+        cov = subfetch.title_coverage(
+            "风味人间.Once.Upon.a.Bite.S05.2024.2160p",
+            "Once Upon a Deadpool 2018 1080p BluRay")
+        assert cov < 1.0
+
+    def test_mixed_name_accepts_single_script(self):
+        # 混排片名 + 纯英文候选：拉丁子集全覆盖即过（纽伦堡口径，不误杀）
+        assert subfetch.title_coverage(
+            "纽伦堡.Nuremberg.2025.2160p.WEB-DL.mkv",
+            "Nuremberg.2025.1080p.Remux") == 1.0
+
+    def test_ampersand_vs_and_still_full(self):
+        # & 与 and 写法不一致：纯符号词元不参与覆盖率
+        assert subfetch.title_coverage(
+            "Deadpool & Wolverine 2024 2160p",
+            "Deadpool and Wolverine 2024 1080p") == 1.0
+
+    def test_unrelated_film_zero(self):
+        assert subfetch.title_coverage("风味人间.Once.Upon.a.Bite.S05.2024",
+                                       "Nuremberg.2025.WEB-DL") == 0.0
+
+
+class TestOsPickGate:
+    """os_pick：片名闸 + 覆盖率主度量——负分错片不能再被选中。"""
+
+    NAME = "风味人间.Once.Upon.a.Bite.S05E07.2024.2160p.WEB-DL"
+
+    def test_rejects_wrong_movie_even_high_downloads(self):
+        deadpool = _os_cand("Once Upon a Deadpool", "Once Upon a Deadpool",
+                            year=2018, downloads=5041, file_id=11926398)
+        assert subfetch.os_pick([deadpool], self.NAME, "2024") == []
+
+    def test_accepts_correct_release(self):
+        right = _os_cand("Once Upon a Bite",
+                         "Once.Upon.a.Bite.S05E07.1080p.WEB-DL",
+                         year=2024, downloads=800, file_id=2)
+        scored = subfetch.os_pick([right], self.NAME, "2024")
+        assert scored and scored[0][1]["file_id"] == 2
+        assert scored[0][0] >= 1.0
+
+    def test_season_mismatch_ranks_below_match(self):
+        wrong = _os_cand("Once Upon a Bite",
+                         "Once.Upon.a.Bite.S05E04.1080p.WEB-DL",
+                         year=2024, downloads=5000, file_id=3)
+        right = _os_cand("Once Upon a Bite",
+                         "Once.Upon.a.Bite.S05E07.1080p.WEB-DL",
+                         year=2024, downloads=800, file_id=4)
+        scored = subfetch.os_pick([wrong, right], self.NAME, "2024")
+        assert scored[0][1]["file_id"] == 4
+
+
 _SRT_B = ("1" + chr(10) + "00:00:01,000 --> 00:00:02,000" + chr(10) + "hello" + chr(10)).encode()
 
 
@@ -506,6 +583,14 @@ class TestSubcatCoreCoverage:
             ["The Show S05E03"], None)
         assert got is not None
         assert got[1] == "subcat:" + right
+
+    def test_fallback_rejects_partial_coverage_wrong_movie(self, monkeypatch):
+        # 0.75 覆盖率的错片（Once Upon a Deadpool）过不了 1.0 闸
+        href = "subs/3003/Once.Upon.a.Deadpool.2018.1080p.html"
+        self._patch(monkeypatch, [href], {"zh": "/x-chs.srt"}, [])
+        assert subfetch.subcat_fetch(
+            _args("风味人间.Once.Upon.a.Bite.S05E07.2024.2160p.mkv"), "zh",
+            ["Once Upon a Bite S05E07"], "不匹配的标题") is None
 
 
 # --- v55：年份判据（subliminal guess_matches 口径，os/subhd/subcat 三条腿共用） ---

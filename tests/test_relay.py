@@ -136,3 +136,20 @@ def test_relay_reports_dead_upstream_as_502_with_reason():
     assert resp.status == 502
     assert "上游无响应" in body.decode("utf-8", "replace")
     assert b"api_key" not in body
+
+
+class TestWindowsBypass:
+    """nt 上无 TCC，中继纯为绕 TCC 而生——直连比多一跳 curl.exe 好。"""
+
+    def test_http_source_returned_as_is_on_windows(self, monkeypatch):
+        from dvpack import relay as relay_module
+
+        monkeypatch.setattr(relay_module.os, "name", "nt")
+        src = "http://jellyfin.lan:8096/Videos/abc/stream.mkv?api_key=x"
+        assert ffmpeg_visible_source(src) == src
+
+    def test_local_path_untouched_on_windows(self, monkeypatch):
+        from dvpack import relay as relay_module
+
+        monkeypatch.setattr(relay_module.os, "name", "nt")
+        assert ffmpeg_visible_source("C:\\media\\a.mkv") == "C:\\media\\a.mkv"

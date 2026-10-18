@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -77,3 +78,26 @@ def probe_timeout() -> float:
     与打包共用同一个覆盖开关：整机过载时统一放大。
     """
     return _env_float("DVPACK_FFMPEG_TIMEOUT") or PROBE_TIMEOUT
+
+
+def robust_rmtree(path: Path, retries: int = 3, delay: float = 0.4) -> bool:
+    """删目录；删不动时先重试，仍失败改名 ._trash_{name}_{pid} 留给 sweep 收。
+
+    POSIX 上 unlink-while-open 照删不误，行为同 shutil.rmtree(ignore_errors=True)。
+    Windows 上文件句柄不让删（http.server 在播分片占着句柄），ignore_errors=True
+    会静默留半个目录，越攒越多。重试仍失败就改名成 serve._sweep_stale_swaps
+    认得的 ._trash_ 前缀，等本 pid 死了随下一轮 sweep 收掉。
+    返回 True=删净；False=留下 trash 待扫。
+    """
+    for _ in range(max(1, retries)):
+        shutil.rmtree(path, ignore_errors=True)
+        if not path.exists():
+            return True
+        time.sleep(delay)
+    if not path.exists():
+        return True
+    try:
+        os.rename(path, path.parent / f"._trash_{path.name}_{os.getpid()}")
+    except OSError:
+        return False
+    return False

@@ -110,3 +110,61 @@ class TestExeSuffix:
         """跨进程/跨 cwd 调用（launchd 守护、prewarm 子进程）路径必须稳定。"""
         assert tools._TOOLS == tools.ROOT / "tools"
         assert tools._TOOLS.is_dir()
+
+
+class TestRobustRmtree:
+    """Windows 文件句柄占用时的删除降级：重试→改名 ._trash_ 待扫。
+
+    POSIX 上 unlink-while-open 照删，第一、四条就是回归锚；中间两条锁死
+    Windows 专属降级路径（monkeypatch 模拟，Mac 上也能跑）。
+    """
+
+    def test_plain_delete_returns_true(self, tmp_path):
+        d = tmp_path / "pack"
+        d.mkdir()
+        (d / "seg0.ts").write_bytes(b"x")
+        assert tools.robust_rmtree(d) is True
+        assert not d.exists()
+
+    def test_locked_dir_falls_back_to_trash_rename(self, tmp_path, monkeypatch):
+        d = tmp_path / "pack"
+        d.mkdir()
+        (d / "seg0.ts").write_bytes(b"x")
+        # 模拟 Windows 句柄占用：rmtree 静默失败（ignore_errors 吃错），
+        # 同卷改名成功 → 留 ._trash_ 给 _sweep_stale_swaps 收。
+        monkeypatch.setattr(tools.shutil, "rmtree", lambda *a, **k: None)
+        assert tools.robust_rmtree(d, retries=2, delay=0.0) is False
+        assert not d.exists()
+        trash = list(tmp_path.glob("._trash_pack_*"))
+        assert len(trash) == 1
+        assert trash[0].name == f"._trash_pack_{os.getpid()}"
+
+    def test_locked_and_unrenamable_reports_false(self, tmp_path, monkeypatch):
+        d = tmp_path / "pack"
+        d.mkdir()
+        (d / "seg0.ts").write_bytes(b"x")
+
+        def _boom(*a, **k):
+            raise OSError("locked")
+
+        monkeypatch.setattr(tools.shutil, "rmtree", lambda *a, **k: None)
+        monkeypatch.setattr(tools.os, "rename", _boom)
+        assert tools.robust_rmtree(d, retries=1, delay=0.0) is False
+        assert d.exists()
+
+    def test_retry_succeeds_on_second_attempt(self, tmp_path, monkeypatch):
+        d = tmp_path / "pack"
+        d.mkdir()
+        (d / "seg0.ts").write_bytes(b"x")
+        real = tools.shutil.rmtree
+        calls = {"n": 0}
+
+        def flaky(*a, **k):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return None  # 第一次被占用，静默失败
+            real(*a, **k)
+
+        monkeypatch.setattr(tools.shutil, "rmtree", flaky)
+        assert tools.robust_rmtree(d, retries=3, delay=0.0) is True
+        assert calls["n"] == 2

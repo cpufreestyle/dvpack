@@ -7,6 +7,7 @@ MIME 类型、单区间 Range、列表与分片不同的缓存策略。
 from __future__ import annotations
 
 import ctypes
+import errno
 import os
 import socket
 import shutil
@@ -32,7 +33,7 @@ from .jfpack import JfPackError, pack_source
 from .p5 import ResignError
 from .probe import NotProbeable
 from .remux import FFMPEG, VIDEO_AUDIO_MAPS, VIDEO_ONLY_MAPS, RemuxError
-from .tools import require
+from .tools import require, robust_rmtree
 from .subsource import SubtitleResolution
 
 # Windows 的注册表常把 .m3u8 映射成乱七八糟的类型，所以不用 mimetypes，显式给表。
@@ -210,6 +211,15 @@ def _rename_swap(src: Path, dst: Path) -> None:
     AVPlayer 每 ~13s 的 playlist 重载不会撞见 404——两步 rename 中间那条
     「目录消失一瞬」的缝，实测就是中场播放失败。
     """
+    if os.name != "darwin":
+        # Windows 没有 renamex_np：ctypes.CDLL(None).renamex_np 直接
+        # AttributeError，而调用方只捕 OSError。主动抛 ENOSYS 让它落进
+        # 已有的两步回落（rename→._trash_*、rename tmp→dst），语义与
+        # macOS 上 swap 失败时一致：路径不断流，中间脏目录由 sweep 收。
+        raise OSError(
+            errno.ENOSYS,
+            "renamex_np is darwin-only; caller falls back to two-step rename",
+        )
     libc = ctypes.CDLL(None)
     func = libc.renamex_np
     func.restype = ctypes.c_int
@@ -222,10 +232,13 @@ def _rename_swap(src: Path, dst: Path) -> None:
 
 
 _SWAP_TMP_PREFIXES = ("._upgrade_", "._trash_")
+_SWAP_STALE_SECONDS = 45 * 60
 
 
 def _pid_alive(pid: int) -> bool:
     """pid 是否还活着。查无此进程=False；权限不够等拿不准的一律算活。"""
+    if os.name == "nt":
+        return _pid_alive_nt(pid)
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
@@ -233,6 +246,23 @@ def _pid_alive(pid: int) -> bool:
     except OSError:
         return True
     return True
+
+
+def _pid_alive_nt(pid: int) -> bool:
+    """Windows 版：OpenProcess 查询，拿不到句柄再看错误码。
+
+    os.kill(pid, 0) 在 Windows 上对死进程抛裸 OSError（WinError 87，不是
+    ProcessLookupError）→ 被「拿不准算活」分支吞 → 死 pid 的回收目录白等
+    45 分钟 mtime 闸。ERROR_ACCESS_DENIED(5)=进程存在但打不开（算活）；
+    其余（87 ERROR_INVALID_PARAMETER 等）=查无此进程。
+    """
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+    if handle:
+        kernel32.CloseHandle(handle)
+        return True
+    return ctypes.get_last_error() == 5  # ERROR_ACCESS_DENIED
 
 
 def _sweep_stale_swaps(parent: Path) -> int:
@@ -244,12 +274,23 @@ def _sweep_stale_swaps(parent: Path) -> int:
     活性，不碰，留给人工。
     """
     swept = 0
+    now = time.time()
     for prefix in _SWAP_TMP_PREFIXES:
         for path in parent.glob(prefix + "*"):
             pid_text = path.name[len(prefix):].rsplit("_", 1)[-1]
-            if not pid_text.isdigit() or _pid_alive(int(pid_text)):
+            if not pid_text.isdigit():
+                # v48 前的老固定名（无 pid 后缀）判不出活性，不碰，留给人工。
                 continue
-            shutil.rmtree(path, ignore_errors=True)
+            if _pid_alive(int(pid_text)):
+                # pid 还活 != 里面还有打包在跑：换装成功后 tmp 装着被替下的
+                # 旧包，主进程不删就永久残留。按 mtime 补第二道闸（全片打包
+                # 约 10 分钟，45 分钟阈值留足余量）。
+                try:
+                    if now - path.stat().st_mtime < _SWAP_STALE_SECONDS:
+                        continue
+                except OSError:
+                    continue
+            robust_rmtree(path)
             swept += 1
     return swept
 
@@ -267,7 +308,7 @@ def _pack_full_swap(src: str, out_dir: Path, maps, texts, item_id: str) -> None:
     _sweep_stale_swaps(parent)
     tmp = parent / f"._upgrade_{item_id}_{os.getpid()}"
     if tmp.exists():
-        shutil.rmtree(tmp, ignore_errors=True)
+        robust_rmtree(tmp)
     tmp.mkdir(parents=True)
     try:
         if not _parallel_full(src, tmp, maps, texts):
@@ -296,7 +337,7 @@ def _pack_full_swap(src: str, out_dir: Path, maps, texts, item_id: str) -> None:
                 # 该次重载失败，下一次重载即恢复）。
                 trash = out_dir.parent / f"._trash_{item_id}_{os.getpid()}"
                 if trash.exists():
-                    shutil.rmtree(trash, ignore_errors=True)
+                    robust_rmtree(trash)
                 os.rename(out_dir, trash)
                 try:
                     os.rename(tmp, out_dir)
@@ -304,13 +345,17 @@ def _pack_full_swap(src: str, out_dir: Path, maps, texts, item_id: str) -> None:
                     if not out_dir.exists():
                         os.rename(trash, out_dir)
                     raise
-                shutil.rmtree(trash, ignore_errors=True)
+                robust_rmtree(trash)
+            # renamex_np 是「交换」不是「移动」：成功后 tmp 路径下装的是被
+            # 替下去的旧包。不删就永远烂在 _jf/._upgrade_* 里（2026-10-18
+            # 现场 9 个残根全是它），pid 不死 sweep 也清不动。
+            robust_rmtree(tmp)
         else:
             os.rename(tmp, out_dir)
     except BaseException:
         # BaseException 而非常规 Exception：Ctrl-C 来的 KeyboardInterrupt
         # 也要清掉自己的 tmp，否则死 pid 残骸只能等下一轮打包时清扫。
-        shutil.rmtree(tmp, ignore_errors=True)
+        robust_rmtree(tmp)
         raise
 
 
@@ -450,7 +495,10 @@ def _pack_playable(out_dir: Path, src: str) -> bool:
 # 连点几部就把盘吃到 100%（2026-10-03 现场：9 部 87GB，926GB 盘可用只剩 1.1GB）。
 # 打满之后每个分片都 ENOSPC、playlist 被冲空、/jf/pack 回 502，电视侧只剩
 # 「播放失败 / Cannot Open」，而真正的原因在 serve 日志里埋着。
-MIN_FREE_BYTES = 12 * 1024 ** 3
+# 24GB 而不是 12GB：单部 4K DV 全片包实测 4.4~7.7G、最坏 15G，且全局并发
+# 2 路全片 + 秒开包同时写盘。闸小于单包最坏体积时，pack 放一半 ENOSPC、
+# playlist 冲空——2026-10-18 现场（15G 可用仍连挂）就是这么来的。
+MIN_FREE_BYTES = 24 * 1024 ** 3
 
 
 def _free_bytes(path: Path) -> float:
@@ -514,8 +562,32 @@ def _ensure_disk_room(root: Path, need_bytes: float, keep: Path | None = None) -
             break
         size = _dir_size_bytes(child)
         print(f"[serve] 磁盘不足，淘汰旧缓存 {child.name}（约 {size / 2**30:.1f}GB）", flush=True)
-        shutil.rmtree(child, ignore_errors=True)
+        robust_rmtree(child)
     return _free_bytes(root) >= need_bytes
+
+
+def _touch_active_pack(filesystem: str) -> None:
+    """播放中的包给 video.m3u8 续命。
+
+    LRU 按 video.m3u8 的 mtime 淘汰旧包，而播放过程只读分片、不改 mtime：
+    看了一半的包时间戳停在开播那一刻，等新片打包触发 _ensure_disk_room 时，
+    在播包会被当成「最旧」误杀 → 中场 404「播放失败」。每次 serve 视频段/
+    playlist 时 touch 一下即防；开销一次 utime，可忽略。
+    """
+    try:
+        path = Path(filesystem)
+        parts = path.parts
+        if "_jf" not in parts or not path.name.startswith("video"):
+            return
+        jf = parts.index("_jf")
+        # 只认 .../_jf/<id>/video... 这一层，子目录（subs/ 等）不碰
+        if jf + 2 != len(parts) - 1:
+            return
+        playlist = path.parent / "video.m3u8"
+        if playlist.is_file():
+            os.utime(playlist, None)
+    except OSError:
+        pass
 
 
 @dataclass(frozen=True)
@@ -676,6 +748,9 @@ class HlsRequestHandler(SimpleHTTPRequestHandler):
             #  客户端看到的是 RemoteDisconnected）
             self.send_error(404, "no such file")
             return
+        # 在播包续命：LRU 按 video.m3u8 mtime 淘汰，播放只读不改 mtime，
+        # 不 touch 的话看了一半的包会被新打包的磁盘闸当中场误杀
+        _touch_active_pack(filesystem)
 
         length = os.stat(filesystem).st_size
         verdict, rng = parse_range(self.headers.get("Range"), length)
@@ -789,7 +864,7 @@ class HlsRequestHandler(SimpleHTTPRequestHandler):
                     _meta_now = {}
                 if _pack_poisoned(_meta_now, out_dir):
                     print(f"[serve] 淘汰毒包 {item_id}，整目录重打", flush=True)
-                    shutil.rmtree(out_dir, ignore_errors=True)
+                    robust_rmtree(out_dir)
                 # 磁盘闸：连淘汰都腾不出 12GB 就明确回 507。硬写的结局是 ffmpeg
                 # 每写一片 ENOSPC、playlist 被冲空，电视侧只剩「播放失败」而
                 # serve 日志里埋着真正的 Errno 28（2026-10-03 现场）。
@@ -799,7 +874,7 @@ class HlsRequestHandler(SimpleHTTPRequestHandler):
                     return
                 # 上次并行打包失败留下的 _part* 中间态：既占盘又是脏线索。
                 for stale in out_dir.glob("_part*"):
-                    shutil.rmtree(stale, ignore_errors=True)
+                    robust_rmtree(stale)
                 # 首包时长权衡：
                 # · 打全片：34 分钟的片要 2~3 分钟，AVPlayer 等 302 超时即放弃，
                 #   真机症状就是「点片没反应 / 播放失败」。
@@ -926,7 +1001,7 @@ class HlsRequestHandler(SimpleHTTPRequestHandler):
             existed = out_dir.exists()
             freed = _dir_size_bytes(out_dir) if existed else 0.0
             if existed:
-                shutil.rmtree(out_dir, ignore_errors=True)
+                robust_rmtree(out_dir)
             # 海报兜底产物一起删：App 里删片要「本地彻底删除」，抽帧海报
             # 虽是增强项也不该在片删掉后继续占着 _posters。
             poster = Path(self.directory) / "_posters" / (item_id + ".jpg")
@@ -1044,7 +1119,7 @@ class HlsRequestHandler(SimpleHTTPRequestHandler):
                     with _pack_lock_for(item_id):
                         try:
                             for stale in out_dir.glob("_part*"):
-                                shutil.rmtree(stale, ignore_errors=True)
+                                robust_rmtree(stale)
                             # 排队复查：等锁/等信号量时前一个 worker 可能已把
                             # 全片打完并把 marker 翻成 0.0。不复查就把整片再
                             # 拉一遍——白耗约 10 分钟 4 路 ffmpeg，还把磁盘推
@@ -1145,11 +1220,17 @@ def _jf_item_name(src: str, item_id: str) -> str:
         return ""
 
 
-def _online_subs_body(directory, src: str, item_id: str, out_dir: Path) -> str:
-    """在线字幕腿同步体（只由后台线程调用）：抓 → 落缓存 → 只换字幕轨。
+def _online_subs_body(directory, src: str, item_id: str, out_dir: Path,
+                      name: str = "") -> str:
+    """在线字幕腿同步体（serve 后台线程 / prewarm 批处理调用）：抓 → 落缓存 → 只换字幕轨。
 
     回执一句话给 serve 日志。全程兜异常：在线腿炸了也不能影响播放。
     步骤与 subsource 分级一一对应，换序先读 subsource docstring。
+
+    name 由调用方直传真片名（prewarm 枚举时就有真名）：Jellyfin 任何一次
+    新登录都会把旧 token 的 /Items 权限踢掉（2026-10-18 实测），靠
+    _jf_item_name 从 src 反查只会 401「缺片名」空转——调用方有名就别再
+    麻烦 /Items。serve 后台线程没有现成名，留空走反查。
     """
     from . import subs, subsource
 
@@ -1158,7 +1239,8 @@ def _online_subs_body(directory, src: str, item_id: str, out_dir: Path) -> str:
     cache_dir = subsource.subtitle_cache_dir(directory, _src_fingerprint(src))
     if subsource.cache_blocked(cache_dir):
         return "负缓存期内，跳过"
-    name = _jf_item_name(src, item_id)
+    if not name:
+        name = _jf_item_name(src, item_id)
     texts, note = subsource.fetch_online_texts(
         src=src, item_id=item_id, name=name, out_dir=out_dir)
     if not texts:

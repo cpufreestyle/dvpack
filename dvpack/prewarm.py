@@ -41,9 +41,9 @@ from .remux import VIDEO_AUDIO_MAPS
 #: 并发硬顶（理由见模块 docstring 的毒包事故）。默认 1 路顺序打。
 MAX_JOBS = 2
 
-#: 每个 item 开打前的磁盘下限，与 serve.MIN_FREE_BYTES 同口径（12GB）。
+#: 每个 item 开打前的磁盘下限，与 serve.MIN_FREE_BYTES 同口径（24GB）。
 #: 预热不擅自 LRU 淘汰别人的包（那是 serve 点片时的职权），不够就跳过。
-DISK_RESERVE_BYTES = 12 * 1024 ** 3
+DISK_RESERVE_BYTES = 24 * 1024 ** 3
 
 #: 决策/结局动作文案，CLI 输出与测试断言共用。
 ACTION_PACK = "pack"
@@ -288,9 +288,17 @@ def _pack_one(root: Path, decision: PreheatDecision,
             serve._pack_full_swap(src, out_dir, VIDEO_AUDIO_MAPS, texts,
                                   item.item_id)
             took = time.time() - started
-            if not texts and subsource.online_enabled():
-                receipt = serve._online_subs_body(root, src, item.item_id, out_dir)
-                log("[预热] 在线字幕 %s：%s" % (item.label, receipt))
+        # 在线字幕腿必须锁外同步跑：_online_subs_body 为换字幕轨要拿同一把
+        # item 锁（不可重入），锁内调用 = 自己卡自己——2026-10-18 实测主线程
+        # 自锁死锁（卡 7 分钟、无 ffmpeg、sample 里无人持锁，持锁者就是自己）。
+        # serve 的用法是起后台线程等锁释放；批处理改成打完包锁外补，分钟级
+        # 公网抓取不挡下一部片子。
+        if not texts and subsource.online_enabled():
+            # 直传枚举真片名：Jellyfin 新登录会踢掉旧 token 的 /Items 权限
+            # （2026-10-18 实测 401），_jf_item_name 反查只会「缺片名」空转。
+            receipt = serve._online_subs_body(root, src, item.item_id, out_dir,
+                                              item.name)
+            log("[预热] 在线字幕 %s：%s" % (item.label, receipt))
         size_gb = serve._dir_size_bytes(out_dir) / 1024 ** 3
         log("[预热] 打包 %s 全片 %.1fGB 用时 %.0fs" % (item.label, size_gb, took))
         return ACTION_PACK, "全片 %.1fGB 用时 %.0fs" % (size_gb, took), size_gb
@@ -405,6 +413,13 @@ def _resolve_token(args) -> str:
 
 def run_from_args(args) -> int:
     """argparse 命名空间 → 枚举 → 计划 →（dry-run 或）打包。"""
+    # 批处理要能当监控看：stdout 重定向到日志文件时是块缓冲，进度/汇总可能
+    # 几个小时不露面（run_prewarm 默认 log=print 同样受害）。行缓冲一下，
+    # tail -f 即时可见。
+    try:
+        sys.stdout.reconfigure(line_buffering=True)
+    except (AttributeError, ValueError):
+        pass
     base = (args.base or "").strip().rstrip("/")
     if not base:
         print("失败：缺 Jellyfin 地址（--base 或 DVPACK_JF_BASE）", file=sys.stderr)
