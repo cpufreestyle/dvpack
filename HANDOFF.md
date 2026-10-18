@@ -2976,3 +2976,9 @@ prewarm 预热（--user root --pw）→ 日常运维（日志/重启/改端口/�
   按行修；重点嫌疑 schtasks /TR quoting 与 here-string 插值。
 - Windows 适配代码只过单测锚定（robust_rmtree / kernel32 pid 探测 / curl+tar
   回退），未真机。真机首跑重点盯：起播、字幕抓取、robust_rmtree 删缓存。
+
+### 同步提交（补记）
+- 0443e43 feat(dvpack): Windows 部署移植（14 文件 +1009/-26）
+- 0604968 merge: 合入远端 9251047——serve.py 保 LF，只摘 IP_ADAPTER_INFO
+  两段式修复，拒 CRLF 全文件翻弄（该修复正好治 Windows lan_address 必崩）
+- origin/master 已推进至 0604968，本地 fix/lan-address 与远端零差异。
