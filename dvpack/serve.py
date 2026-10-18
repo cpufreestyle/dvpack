@@ -1421,26 +1421,28 @@ def _windows_iface_addresses() -> list[str]:
     )
 
     class IP_ADAPTER_INFO(ctypes.Structure):
-        _fields_ = (
-            ("Next", ctypes.POINTER(IP_ADAPTER_INFO)),
-            ("ComboIndex", ctypes.c_ulong),
-            ("AdapterName", ctypes.c_char * 256),
-            ("Description", ctypes.c_char * 128),
-            ("AddressLength", ctypes.c_uint),
-            ("Address", ctypes.c_byte * 8),
-            ("Index", ctypes.c_ulong),
-            ("Type", ctypes.c_uint),
-            ("DhcpEnabled", ctypes.c_uint),
-            ("CurrentIpAddress", ctypes.POINTER(IP_ADDR_STRING)),
-            ("IpAddressList", IP_ADDR_STRING),
-            ("GatewayList", IP_ADDR_STRING),
-            ("DhcpServer", IP_ADDR_STRING),
-            ("HaveWins", ctypes.c_int),
-            ("PrimaryWinsServer", IP_ADDR_STRING),
-            ("SecondaryWinsServer", IP_ADDR_STRING),
-            ("LeaseObtained", ctypes.c_ulonglong),
-            ("LeaseExpires", ctypes.c_ulonglong),
-        )
+        pass
+
+    IP_ADAPTER_INFO._fields_ = (
+        ("Next", ctypes.POINTER(IP_ADAPTER_INFO)),
+        ("ComboIndex", ctypes.c_ulong),
+        ("AdapterName", ctypes.c_char * 256),
+        ("Description", ctypes.c_char * 128),
+        ("AddressLength", ctypes.c_uint),
+        ("Address", ctypes.c_byte * 8),
+        ("Index", ctypes.c_ulong),
+        ("Type", ctypes.c_uint),
+        ("DhcpEnabled", ctypes.c_uint),
+        ("CurrentIpAddress", ctypes.POINTER(IP_ADDR_STRING)),
+        ("IpAddressList", IP_ADDR_STRING),
+        ("GatewayList", IP_ADDR_STRING),
+        ("DhcpServer", IP_ADDR_STRING),
+        ("HaveWins", ctypes.c_int),
+        ("PrimaryWinsServer", IP_ADDR_STRING),
+        ("SecondaryWinsServer", IP_ADDR_STRING),
+        ("LeaseObtained", ctypes.c_ulonglong),
+        ("LeaseExpires", ctypes.c_ulonglong),
+    )
 
     iphlpapi = ctypes.WinDLL("iphlpapi")
     GetAdaptersInfo = iphlpapi.GetAdaptersInfo
