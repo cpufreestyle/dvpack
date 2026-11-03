@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import os
 import struct
+import tempfile
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
@@ -879,12 +880,23 @@ def atomic_write(path: Path, data: bytes) -> None:
     拉完 200 后静默停播——比失败更难排查。临时文件与目标同文件系统，
     os.replace 的替换是原子的，读者只会见到旧文件或新文件。
     """
-    tmp = path.with_name(f"{path.name}.tmp")
-    with open(tmp, "wb") as handle:
-        handle.write(bytes(data))
-        handle.flush()
-        os.fsync(handle.fileno())
-    os.replace(tmp, path)
+    # 临时文件名唯一化：固定 ".tmp" 名在多进程同时 fix-up 时会撞车（2026-09-26
+    # init.mp4 被截 0 字节事故的头号嫌疑）。mkstemp 同目录唯一名，fsync 后
+    # os.replace 原子替换语义不变。
+    fd, tmp = tempfile.mkstemp(
+        dir=path.parent, prefix=f"{path.name}.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(bytes(data))
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 # --------------------------------------------------------------------------
