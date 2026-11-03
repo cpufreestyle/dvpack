@@ -12,6 +12,7 @@ import os
 import socket
 import shutil
 import subprocess
+import sys
 import time
 import traceback
 
@@ -1359,17 +1360,26 @@ def _posix_iface_addresses() -> list[str]:
     import ctypes
     from ctypes.util import find_library
 
-    class sockaddr_in(ctypes.Structure):
-        # macOS/BSD 的 sockaddr 带 sa_len 前缀、sa_family_t 是 1 字节；Linux 是
-        # 2 字节无前缀。两边共用这个布局：family 落在第 1 字节，sin_addr 都在
-        # 偏移 4（macOS 的 sin_len 占了第 0 字节）。
-        _fields_ = (
-            ("sin_len", ctypes.c_ubyte),
-            ("sin_family", ctypes.c_ubyte),
-            ("sin_port", ctypes.c_uint16),
-            ("sin_addr", ctypes.c_ubyte * 4),
-            ("sin_zero", ctypes.c_ubyte * 8),
-        )
+    # macOS/BSD 的 sockaddr 带 sa_len 前缀、sa_family_t 是 1 字节；Linux 没有
+    # sa_len、sa_family_t 是 2 字节主机字节序。只有 family 的宽度和位置不同，
+    # sin_addr 两边都在偏移 4，按平台挑视图。
+    if sys.platform == "linux":
+        class sockaddr_in(ctypes.Structure):
+            _fields_ = (
+                ("sin_family", ctypes.c_uint16),
+                ("sin_port", ctypes.c_uint16),
+                ("sin_addr", ctypes.c_ubyte * 4),
+                ("sin_zero", ctypes.c_ubyte * 8),
+            )
+    else:
+        class sockaddr_in(ctypes.Structure):
+            _fields_ = (
+                ("sin_len", ctypes.c_ubyte),
+                ("sin_family", ctypes.c_ubyte),
+                ("sin_port", ctypes.c_uint16),
+                ("sin_addr", ctypes.c_ubyte * 4),
+                ("sin_zero", ctypes.c_ubyte * 8),
+            )
 
     class ifaddrs(ctypes.Structure):
         pass
