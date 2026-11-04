@@ -817,10 +817,13 @@ def clamp_dvcC_level(data: bytes, level: int) -> tuple[bytes, int | None]:
     只降不升：源签得比分辨率档位还保守时不动，不把能力签高。dvcC 无校验和，
     改 dv_level 所在字节即可；定位走 locate_dv_boxes 的绝对偏移。
 
-    dvcC 位域（2026-10-02 用三个样本互证标定）：payload[2] 高 7 位是
-    dv_profile、低 1 位是 rpu_present_flag；payload[3] 高 5 位是 dv_level、
-    低 3 位是 el/bl 等存在位。实测 0x4d→9（不亮版）、0x35→6（点亮版）、
-    0x1d→3（Apple 1080p 官方参考流），一律 level<<3 | flags。
+    dvcC 位域（2026-10-02 三样本互证 + Dolby spec 布局核对）：16 个 payload
+    位是 profile(7) → level(6) → rpu/el/bl present(各 1)。payload[2] 高 7 位
+    是 dv_profile、低 1 位是 dv_level 的最高位（真实 level≤13 恒为 0）；
+    payload[3] 高 5 位是 dv_level 低 5 位、低 3 位是 rpu/el/bl present。
+    本函数只动 payload[3]（(level & 0x1f)<<3 | 原低 3 位），对真实 level
+    1-13 语义正确。实测 0x4d→9（不亮版）、0x35→6（点亮版）、0x1d→3
+    （Apple 1080p 官方参考流）。
     """
     for box in locate_dv_boxes(data):
         if box.fourcc != "dvcC" or len(box.payload) < 4:
