@@ -29,80 +29,9 @@ from .dvprofile import DV_BOX_CANONICAL, DV_BOX_NAMES
 from .bmff import DvBox, atomic_write, insert_box_after, locate_dv_boxes
 from .probe import DoviRecord
 
-
-class ResignError(Exception):
-    pass
-
-
-@dataclass(frozen=True)
-class DvcConfig:
-    """只覆盖我们真正会写的字段；版本号与尾巴字节原样保留。
-
-    参照字节：
-      ffmpeg  P8 L6  `01 00 10 35 10 00 ...`
-      Apple   P5 L6  `01 00 0a 35 00 00 ...`
-      Apple   P5 L3  `01 00 0a 1d 00 00 ...`
-    """
-
-    version_major: int
-    version_minor: int
-    profile: int
-    level: int
-    rpu_present: bool
-    el_present: bool
-    bl_present: bool
-    compat_id: int
-    tail: bytes
-
-    # 字段落位（byte0 起）：
-    #   0     version_major
-    #   1     version_minor
-    #   2     profile(7) | level[5](1)
-    #   3     level[4:0](5) | rpu_present(1) | el_present(1) | bl_present(1)
-    #   4     compat_id(4) | 低半字节保留
-    #   5..   其余字段，Apple 官方与 ffmpeg 都写全零，原样保留
-    @classmethod
-    def parse(cls, payload: bytes) -> DvcConfig:
-        if len(payload) < 5:
-            raise ResignError(f"DOVI 配置 record 只有 {len(payload)} 字节，不足 5")
-        return cls(
-            version_major=payload[0],
-            version_minor=payload[1],
-            profile=payload[2] >> 1,
-            level=((payload[2] & 0x01) << 5) | (payload[3] >> 3),
-            rpu_present=bool(payload[3] & 0x04),
-            el_present=bool(payload[3] & 0x02),
-            bl_present=bool(payload[3] & 0x01),
-            compat_id=payload[4] >> 4,
-            tail=payload[5:],
-        )
-
-    def encode(self) -> bytes:
-        head = bytearray(5)
-        head[0] = self.version_major & 0xFF
-        head[1] = self.version_minor & 0xFF
-        head[2] = ((self.profile & 0x7F) << 1) | ((self.level >> 5) & 0x01)
-        head[3] = (
-            (self.level & 0x1F) << 3
-            | (int(self.rpu_present) << 2)
-            | (int(self.el_present) << 1)
-            | int(self.bl_present)
-        )
-        head[4] = (self.compat_id & 0x0F) << 4
-        return bytes(head) + bytes(self.tail)
-
-    def to_dovi_record(self) -> DoviRecord:
-        """桥接 probe.DoviRecord，供 verify() 与 ffprobe 结果比对。"""
-        return DoviRecord(
-            profile=self.profile,
-            level=self.level,
-            rpu_present=self.rpu_present,
-            el_present=self.el_present,
-            bl_present=self.bl_present,
-            compat_id=self.compat_id,
-            md_compression="none",
-            spec_version=f"{self.version_major}.{self.version_minor}",
-        )
+# 位域唯一实现收拢到 dvconfig（Infuse 笔记第 3 条）：测试与外部调用方
+# 仍从 p5 引用这两个名字，这里再导出保持兼容。
+from .dvconfig import DvcConfig, ResignError
 
 
 @dataclass(frozen=True)

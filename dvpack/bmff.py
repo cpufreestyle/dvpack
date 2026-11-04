@@ -27,6 +27,7 @@ from .dvprofile import (
     RPU_NAL_PREFIX,
     RPU_NAL_TYPES,
 )
+from .dvconfig import DvcConfig
 
 VIDEO_SAMPLE_ENTRIES = DV_SAMPLE_ENTRIES | NON_DV_SAMPLE_ENTRIES
 
@@ -826,14 +827,14 @@ def clamp_dvcC_level(data: bytes, level: int) -> tuple[bytes, int | None]:
     （Apple 1080p 官方参考流）。
     """
     for box in locate_dv_boxes(data):
-        if box.fourcc != "dvcC" or len(box.payload) < 4:
+        if box.fourcc != "dvcC" or len(box.payload) < 5:
             continue
-        current = box.payload[3] >> 3
-        if current <= level:
+        config = DvcConfig.parse(bytes(box.payload))
+        if config.level <= level:
             return data, None
         buf = bytearray(data)
-        buf[box.payload_offset + 3] = (level << 3) | (box.payload[3] & 0x07)
-        return bytes(buf), current
+        buf[box.payload_offset + 3] = ((level & 0x1F) << 3) | (box.payload[3] & 0x07)
+        return bytes(buf), config.level
     return data, None
 
 
