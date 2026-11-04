@@ -246,3 +246,204 @@ rg -o "/Users/mercdev/jenkins/workspace/FireCore/Infuse/Infuse/[^\"']*" /tmp/inf
 本笔记只做架构与设计模式层面的学习。未破解授权机制、未复制 Infuse 代码进 dvpack、
 未分析其 DRM/付费逻辑。dvpack 的模块集成仍限于 ffmpeg / dovi_tool / Bento4 等开源组件。
 
+
+---
+
+# 第二轮（2026-10-30）：补挖 Services / GUI / 缓存层——对标 dvplay 的已知病灶
+
+> 同一 arm64 slice（SHA-256 e1f6dd3b…50d，78MB）重抽 strings 后补的定向提取。
+> 上一轮只覆盖 Demuxing / DV 信令 / 网络流 / 字幕四层；本轮补 `Classes/Services`
+> （263 文件）、`Classes/GUI/Controllers`（109 文件）与缩略图缓存体系。
+> 863 个源文件路径已提取至 `/tmp/infuse-rea/paths.txt`（/tmp 会被系统清，下轮需重抽）。
+
+## 6. 缩略图三级缓存（对标 dvplay「海报有些没显示」）
+
+Infuse 的命名面（二进制符号实见）：
+
+```
+ThumbnailsMemoryCache / ThumbnailsSqliteDiskCacheDAOObjc / ThumbnailsLinksCache
+ThumbnailsReferencesCache / ThumbnailsCachePolicy / CachePolicyForRequest
+ThumbnailsCacheHousekeepingModel / HousekeepingService(Default|Stage|Request|InContainer)
+DiskCacheP / DiskCacheDAOObjc / DiskCacheDisabled / DiskCacheTitle
+ThumbnailLoader(+Factory|Type|Result) / ThumbnailProcessor(+Factory|ScaleMode)
+ThumbnailOperation(+Factory|WithType) / ThumbnailKey / ThumbnailLinkID / ThumbnailPathWithItemID
+ThumbnailIsLoading(+WithItem) / ThumbnailBlurRadius / ThumbnailHeightConstraint / ThumbnailOfSize
+```
+
+可借鉴的三点：
+
+1. **Key 与 Link 分离**：`ThumbnailKey`（item→key）、`ThumbnailLinkID`（指向 URL 的稳定
+   标识）、`ThumbnailPathWithItemID`（磁盘路径由 itemID 决定）。dvplay 现在海报没显示
+   的排查难点正在于「是没拿到 URL、还是 URL 拿到了图没下到、还是下到了没渲染」——
+   三级 Key/Link/Path 一分开，这三个阶段各自可观测、可分别缓存。
+2. **HousekeepingService 常驻清理**：`HousekeepingServiceDefaultStage` 按 stage 推进，
+   配 `CachePolicyForRequest` 逐请求定策略（是否允许回源、是否进磁盘、TTL）。
+   dvplay 的 serve 磁盘闸是全局 LRU，海报这种小文件和大分片挤同一个池。
+3. **IsLoading 单独一个符号**：`ThumbnailIsLoading(+WithItem)` 说明「加载中」是一等
+   状态，由 loader 持有而非 view 自己记。dvplay 海报墙在焦点快速移动时反复触发同一张
+   图的请求，缺的就是这个去重态——这也与上一轮 `SequentialSharingInputStream` 同源。
+
+## 7. 仓库分层与分页（对标 dvplay「片库读取失败」「点击海报播放失败」）
+
+```
+ItemsControllers/Common/Repository/IVCItemsRepository.m
+                                /IVCItemsRepositorySet.m
+                                /Loading/Collections/FCCollectionsLoader.swift
+                                /MediaItems/FoldersFetching/IVCMediaItemsRepositoryFetchingFactory.swift
+Symbols: RepositoryID / RepositoryError / RepositoryResolverSubscription /
+        ItemsRepositoryFetchingFactory / ItemsRepositoryDisplayFlags / ItemsRepositoryContext
+Enumerators/FCBatchLoadingEnumerator.m
+Symbols: PaginationRequest / PaginationResponse / PaginationError / PageSize(×15)
+```
+
+可借鉴：
+
+1. **Repository 是显式的一等抽象**，带自己的 `RepositoryID` 与 `RepositoryError`，
+   视图层只面对 Repository 而不认识 Plex/Emby/Jellyfin。dvplay 现在直连 dvpack serve
+   的 JSON，服务端一抖动就是「片库读取失败」这种无差别错误；分出 Repository 层才能
+   把「网络错 / 解析错 / 空库」区分成可展示的不同文案。
+2. **`ItemsRepositorySet` + `RepositoryResolverSubscription`**：多个数据源（本地 +
+   Plex + 云盘）合成一个集合，用订阅而非回调广播变化。dvpack 侧 `jfmeta.py` 已经
+   在聚合 Jellyfin 元数据，缺的是把「集合 + 订阅」的契约显式化。
+3. **`PaginationRequest/PaginationResponse` + `FCBatchLoadingEnumerator`**：分批加载
+   是一等公民。dvplay 海报墙一次拉全库，片一多就「有些无法点击播放」；分批加载天然
+   把「加载中/失败/可交互」限定在当前页。
+4. `DisplayFlags` / `Context` 说明视图状态（显示什么、在哪个上下文）与数据是分开传的。
+
+## 8. 索引健壮性（对标 dvplay「片库读取失败」「闪退」）
+
+```
+Indexing/Core/Indexer/CrashProtection/FCIndexingCountersManager.m
+Indexing/Core/Indexer/IndexingState/FCShareIndexingState.m
+                      /StateManager/ShareIndexingStateManager.Default.swift
+Indexing/Core/Utils/DirectoryWatcher.swift
+Indexing/Core/FolderIndexer/FCFolderIndexer.m
+Indexing/MetaDiff/{DefaultIncrementalMetadataRefreshService,MetaDiffFetcher}.swift
+Indexing/Crawling/Tree/{TreeCrawlingService,Filters/Index/CrawledItemsTreeFilter}.swift
+                     Strategies/{FolderCrawlingStrategy,RecursiveCrawlingStrategy}.swift
+```
+
+可借鉴：
+
+1. **CrashProtection + 计数器**：索引崩溃被单独一个 Manager 计数、记状态。dvplay 在
+   海报墙移动焦点时闪退，且是偶发；Infuse 的思路是把易崩流程（索引/抓取）与主 UI
+   进程隔离并计数重试，而不是让一次异常冒到 UI 层。
+2. **IndexingState 是按 share 的状态机**（`FCShareIndexingState` +
+   `ShareIndexingStateManager`），每个共享源独立状态。dvpack 的多源（Jellyfin/SMB/
+   本地）目前没有按源的状态记录，一个源卡住会影响整体观感。
+3. **DirectoryWatcher + 增量刷新**：`MetaDiffFetcher` 只对变化的元数据做增量刷新，
+   而不是全量重扫。dvplay 每次进片库全量拉，海报多了就慢；增量是明确的优化方向。
+4. **TreeCrawlingService + 两种 CrawlingStrategy（Folder/Recursive）**：策略可换。
+
+## 9. 排序策略化（对标 dvplay「优化片子分类」）
+
+```
+Symbols: SortingStrategyFactory / SortingBaseStrategy / SortingStrategyP
+         SortingByTitleStrategy / SortingByTitleAndPersonsComeLastStrategy
+         SortingByReleaseDateStrategy / SortingByRecentlyAdded
+         SortingByItemIDStrategy / SortingByFileNameStrategy / SortingByDateStrategy
+         SortingMode(ByTitle|ByReleaseDate|ByFileName) / SortingModeForCollections
+         SortingResult / SortingStrategyEpisodesMode
+         GroupingInfo / GroupingOptions / OrderingInfo / OrderingParams
+```
+
+可借鉴：排序是「工厂 + 策略基类 + 命名策略」的结构，且 **`SortingByTitleAndPersonsComeLast`
+单独成一个策略**（演员/人物条目排在片名之后）——说明它把「排序」当成会被用户改、
+会因集合类型（Collections 用 `SortingModeForCollections`）而不同的可替换行为。
+dvplay 的分类现在是服务端固定顺序；把排序抽成策略，用户就能按「最近添加 / 发行年 /
+   标题」切换，且不影响缓存 key。
+
+## 10. 其他值得记的命名面
+
+- **播放进度与收藏**：`PlaybackProgressDAO`、`WatchedStatusForMovieMetaID/EpisodeMetaID`、
+  `ResumePlaybackMode`、`ResumePct`；`FavoritesManager`、`HomeOrderRouter`、
+  `FavoritesProvider(+Delegate)`、`FavoriteLocation`。Infuse 把「看过没/看到哪」
+  和「收藏在哪」都做成可同步插件（见 `iCloudSync/Model/Plugins/Favorites`）。
+- **iCloudSync 是插件化同步**：`Model/Plugins/{Favorites,Links,VFS,PlaybackSettings,
+  UpNextAndProgress,MetadataCache}` 各一个 Plugin，`FCSyncModelTrigger` 触发，
+  `ConflictResolution/SyncGroupDuplicatesFilterStrategy` 处理冲突。dvplay 若要跨设备
+  共享「看到哪」，这是现成的分层范式（本地 DAO + 同步插件 + 冲突策略）。
+- **tvOS 专属代码极少**：路径里只有 `Controller_tvOS/`、`non-tvOS/`、`iOS+tvOS/`
+  三类目录，证明它用同一套 UI 代码跑三端，靠目录约定隔离差异。dvplay 单攻 tvOS，
+  这一点反过来提示：别为 tvOS 单独复制一份 UI 逻辑，差异要收敛到少量扩展点。
+- **`ItemsControllers/Common/Actions/`** 把「删除确认 / 移动 / 菜单」拆成
+  Handler + Operation 两层（`IVCDeletionHandler` / `IVCDeletionOperation`）。dvplay
+  用户要的「ATV 里删了本地一起删」，正是 Handler（交互）+ Operation（真删）的划分。
+
+## 11. 本轮结论（回答「还有什么可借鉴」）
+
+按对 dvplay 当前病灶的针对性排序：
+
+1. 缩略图三级缓存 + Key/Link/Path 分离 + IsLoading 去重（海报不显示、快速移动焦点重复请求）；
+2. Repository 一等抽象 + 分批加载（片库读取失败、海报点不动、错误文案不可区分）；
+3. 索引 CrashProtection 计数 + 按 share 状态机 + 增量刷新（片库读取失败、偶发闪退）；
+4. 排序策略化（片子分类可切换）；
+5. 删除 Handler/Operation 分层（ATV 删除联动本地）。
+
+仍未做（承接上一轮遗留）：#5 速率统计→自适应预取、#6 RPU 动态元数据建模。
+
+## 12. 落地核对（2026-10-30 第二轮，逐条比对 dvplay 现状）
+
+本节把上面的建议与 dvplay 代码实际比对，避免「报了的其实早做了」。
+
+**dvplay 已自行实现，比笔记记的更细（不必再做）**：
+
+- 缩略图缓存：`PosterImage` 已有 `NSCache`（150 条 / 48MB 双上限）+
+  降采样（`ThumbnailDecode`，300pt 上限按屏幕 scale）+ 邻位预取 +
+  失败重试一次（0.6s 间隔，注释即写明治「海报有些没显示」）。
+- 货架缓存：`JellyfinLibraryView` 用 `shelfSignature`（只含片源/搜索/筛选/
+  排序，焦点不进签名）治焦点移动 324ms 重建；`@FocusState focusedItemId`
+  显式给初始焦点，治「点片没反应」。
+- 分批加载：`JellyfinClient.fetchItems` 已按 Limit 50 分页 +
+  `startIndex > 1000` 保险丝。
+- 删除分层：`IVCDeletionHandler/Operation` 对应物已有——`jfDelete` +
+  `purgePackCache`（Jellyfin DELETE 后联动清 dvpack `/jf/purge`）。
+- 播放进度/续播：`continueWatching(from:)` 货架 + `resumeProgress` 已实现。
+
+**本轮新落地（第 7 条 Repository/错误分类的一部分）**：
+
+- 新增 `dvplay/LibraryLoadState.swift`：`LibraryLoadState` +
+  `LibraryLoadFailure`（unreachable / unauthorized / server / malformed /
+  empty / cancelled 六类，各带中文文案 + `isTransient`）。
+- `jfLoadItems` 改为按类型给文案（不再一律 `error.localizedDescription`）+
+  瞬时失败自动重试三轮（0.8s / 1.6s 退避）+ 空库不算故障 + 取消不刷屏。
+- 动机：原来 `Failure` 已分好类却在 catch 里被降级，网络闪断 / token 失效 /
+  Jellyfin 500 在电视上同为一句「片库读取失败」，用户无从判断该重试还是重登。
+- 验证：`xcodebuild generic/platform=tvOS` 编译通过；分类映射表用
+  swift 脚本逐码验证（-1009/-1001/-1003/-1004/-1006→unreachable，
+  -1013→unauthorized，401/403→unauthorized，5xx→server，-999→cancelled）。
+
+**仍未做**：#5 速率统计→自适应预取、#6 RPU 动态元数据建模、
+按 share 的索引状态机、DirectoryWatcher 增量刷新。
+
+**核对后确认 dvplay 已实现、不再作为建议（2026-10-30）**：
+
+- 排序策略化（第 9 节）：dvplay 已有 `SortMode`（名称/年份/体积）+ 顶部循环切换 UI，
+  且 name 模式专门处理了剧集分组（seriesGroupKey + season/episode）与
+  E01/E10 乱序。比 Infuse 的 `SortingByTitleStrategy` 更贴合中文片库，
+  抽成策略类只会把已调好的逻辑打散，不做。
+- 续播/收藏（第 10 节）：`continueWatching(from:)` + `resumeProgress` 已有。
+- 删除分层（第 10 节）：`jfDelete` + `purgePackCache` 已覆盖
+  Handler/Operation 的划分，且多做了 dvpack 侧缓存联动。
+
+## 12. 结论：Infuse.app 保留，不删除（2026-10-30 用户问及「如果没有可学的就删」）
+
+**判断：仍有两项不可替代的用途，建议保留。**
+
+1. **它是 DV 徽标的唯一验收基准，且已写进 HANDOFF 的事实链。** HANDOFF.md 中 31 处
+   提及，反复记载「徽标验收只认 Infuse」「只有 Infuse 这类自带真 DV 输出通路的 app
+   才会点亮；通用 AVPlayer app 不触发」「已验证 Infuse 能点亮我们的流」
+   （HANDOFF v21/v22）。删除它，dvpack 的打包产物就失去对照判据——dvplay 自研
+   app 至今点不亮，没有 Infuse 就无法区分「包不对」还是「app 没走 DV 通路」。
+2. **静态分析的原始产物在 /tmp，已被系统清过一轮**（`/tmp/infuse-rea/` 2026-10-18
+   已不存在，本轮重抽）。二进制本体是这些产物唯一的再生产源，删了下次要重新
+   从 308MB 里切 slice。
+
+**成本**：308MB（MacOS 161M + Frameworks 102M + Resources 45M）。当前根卷剩 70GiB，
+占比 0.4%，磁盘不构成删除理由。
+
+**已无参考价值的部分**：付费/IAP/订阅逻辑（`Classes/Services/IAP`、GUI/IAPs）——
+按既定边界从未分析、也不建议分析，与 dvpack 目标无关。
+
+**结论**：可学的东西已沉淀为本笔记 11 节，二进制保留作验收基准。若将来 dvplay
+自己能稳定点亮 DV，Infuse 的基准作用消失，届时可再评估删除。
