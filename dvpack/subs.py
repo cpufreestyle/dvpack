@@ -196,7 +196,9 @@ def subtitle_playlist_text(
     spans = [span for span in chunks if span[1] > span[0]]
     first_cue = None
     for index, (start, stop) in enumerate(spans):
-        if arrow in data[start:stop]:
+        # 跳过 0 时长 cue：头段合并跨度直到首条可用 cue，中间坏 cue 的文本
+        # 仍被合并段带出去，避免「0 时长段被滤掉 → WEBVTT 头跟着丢」。
+        if arrow in data[start:stop] and _cue_seconds(data[start:stop]) > 0:
             first_cue = index
             break
     if first_cue is None:

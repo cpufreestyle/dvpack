@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import os
 import struct
+import tempfile
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
@@ -26,6 +27,7 @@ from .dvprofile import (
     RPU_NAL_PREFIX,
     RPU_NAL_TYPES,
 )
+from .dvconfig import DvcConfig
 
 VIDEO_SAMPLE_ENTRIES = DV_SAMPLE_ENTRIES | NON_DV_SAMPLE_ENTRIES
 
@@ -816,20 +818,23 @@ def clamp_dvcC_level(data: bytes, level: int) -> tuple[bytes, int | None]:
     只降不升：源签得比分辨率档位还保守时不动，不把能力签高。dvcC 无校验和，
     改 dv_level 所在字节即可；定位走 locate_dv_boxes 的绝对偏移。
 
-    dvcC 位域（2026-10-02 用三个样本互证标定）：payload[2] 高 7 位是
-    dv_profile、低 1 位是 rpu_present_flag；payload[3] 高 5 位是 dv_level、
-    低 3 位是 el/bl 等存在位。实测 0x4d→9（不亮版）、0x35→6（点亮版）、
-    0x1d→3（Apple 1080p 官方参考流），一律 level<<3 | flags。
+    dvcC 位域（2026-10-02 三样本互证 + Dolby spec 布局核对）：16 个 payload
+    位是 profile(7) → level(6) → rpu/el/bl present(各 1)。payload[2] 高 7 位
+    是 dv_profile、低 1 位是 dv_level 的最高位（真实 level≤13 恒为 0）；
+    payload[3] 高 5 位是 dv_level 低 5 位、低 3 位是 rpu/el/bl present。
+    本函数只动 payload[3]（(level & 0x1f)<<3 | 原低 3 位），对真实 level
+    1-13 语义正确。实测 0x4d→9（不亮版）、0x35→6（点亮版）、0x1d→3
+    （Apple 1080p 官方参考流）。
     """
     for box in locate_dv_boxes(data):
-        if box.fourcc != "dvcC" or len(box.payload) < 4:
+        if box.fourcc != "dvcC" or len(box.payload) < 5:
             continue
-        current = box.payload[3] >> 3
-        if current <= level:
+        config = DvcConfig.parse(bytes(box.payload))
+        if config.level <= level:
             return data, None
         buf = bytearray(data)
-        buf[box.payload_offset + 3] = (level << 3) | (box.payload[3] & 0x07)
-        return bytes(buf), current
+        buf[box.payload_offset + 3] = ((level & 0x1F) << 3) | (box.payload[3] & 0x07)
+        return bytes(buf), config.level
     return data, None
 
 
@@ -879,12 +884,23 @@ def atomic_write(path: Path, data: bytes) -> None:
     拉完 200 后静默停播——比失败更难排查。临时文件与目标同文件系统，
     os.replace 的替换是原子的，读者只会见到旧文件或新文件。
     """
-    tmp = path.with_name(f"{path.name}.tmp")
-    with open(tmp, "wb") as handle:
-        handle.write(bytes(data))
-        handle.flush()
-        os.fsync(handle.fileno())
-    os.replace(tmp, path)
+    # 临时文件名唯一化：固定 ".tmp" 名在多进程同时 fix-up 时会撞车（2026-09-26
+    # init.mp4 被截 0 字节事故的头号嫌疑）。mkstemp 同目录唯一名，fsync 后
+    # os.replace 原子替换语义不变。
+    fd, tmp = tempfile.mkstemp(
+        dir=path.parent, prefix=f"{path.name}.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(bytes(data))
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 # --------------------------------------------------------------------------

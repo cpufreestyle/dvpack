@@ -2979,6 +2979,64 @@ prewarm 预热（--user root --pw）→ 日常运维（日志/重启/改端口/�
 
 ### 同步提交（补记）
 - 0443e43 feat(dvpack): Windows 部署移植（14 文件 +1009/-26）
-- 0604968 merge: 合入远端 9251047——serve.py 保 LF，只摘 IP_ADAPTER_INFO
+- 0604968 merge: 合入远端 9251047——serve.py 保 LF、只摘 IP_ADAPTER_INFO
   两段式修复，拒 CRLF 全文件翻弄（该修复正好治 Windows lan_address 必崩）
 - origin/master 已推进至 0604968，本地 fix/lan-address 与远端零差异。
+
+## 23:12 段：安全门禁清零 + LAN Linux 修复 + dvconfig 收拢 + PR #2（跨 11-03/11-05 会话）
+
+### 主线（审核 → 修复 → 重构）
+- bugbot 只读审核（code-reviewer 代理 + 人工复核）：1 个 Important——
+  `_posix_iface_addresses()` 的 sockaddr_in 用 macOS/BSD 布局，Linux 小端
+  family 字节恒读 0 → getifaddrs 枚举恒空 → lan_address() 静默退回 TUN
+  198.18.x（分支 headline fix 在 Linux 上失效）。修复 5bd2e1d：按平台挑
+  视图（Linux family 2 字节 sa_family_t @偏移 0；macOS/BSD 保 sa_len 前
+  缀），结构体模拟 family=2/10.0.2.2 + macOS 真机 lan_address=192.168.1.191。
+- Mimosa git 门禁拦截（33 高危）：密封深扫 32 项 + 1 依赖 advisory，分诊
+  为「26 项未跟踪本地脚本（tools/、_scratch/ 已 gitignore 但扫描器不尊重
+  gitignore）+ 6 项仓库代码」。全部原地修复，不绕钩子不豁免（写入门禁只
+  认候选块内完整校验：getaddrinfo+ipaddress 或 urlsplit 消毒值流入 sink；
+  跨文件入口告警也计门禁高危）。高危 30→0，提交 d4be73c。
+- 卫生项 a867522：bmff dvcC 位域注释纠偏（payload[2] 低位是 level 最高位，
+  非 rpu_present_flag）；subs 零时长首 cue 不再连 WEBVTT 头一起丢（头段
+  合并跨度到首条时长>0 的 cue，中间坏 cue 文本仍被带出）。
+- Infuse 静态学习笔记入库 3383a00（+201 行，用户自己的架构研究）。
+- dvconfig 收拢 8120704：Infuse 笔记第 3 条落地——p5.DvcConfig 本身就是
+  统一抽象，缺的是 bmff.clamp_dvcC_level 裸读字节。新建 dvpack/dvconfig.py
+  位域唯一实现（尊重 dvprofile「位域不搬进来」边界，放平级模块），p5 再
+  导出保持测试兼容，clamp 读数统一走 parse（6 位全量真值），写侧仍只动
+  payload[3] 单字节；测试夹具从病态 4 字节补足规范 24 字节形。
+- PR #2 已建：fix/lan-address → master（5 提交）
+  https://github.com/cpufreestyle/dvpack/pull/2
+
+### 关闭项（查实，非新代码）
+- 「prewarm 首段+热点窗口」关闭：serve INSTANT_PACK_SECONDS 起播 stub +
+  后台补全片早已覆盖该设计（prewarm 只批量预打全片），再做会重复现有机制。
+
+### 未闭环（明示，勿当已过）
+- Linux 真机验证 lan_address() 未跑成：DGX Spark SSH banner 超时（11-04/
+  11-05 两天复测均超时）、colima 镜像下载被网络卡死（磁盘零增长 8 分钟，
+  GitHub 托管镜像拉不动）。留给用户一条命令：
+  `python3 -c "from dvpack.serve import _posix_iface_addresses; a=_posix_iface_addresses(); print(a); assert a"`
+  非空即证明修复生效（旧代码 Linux 恒返回 []）。
+- P1 不变：.68 Windows 真机首跑三盯点（起播/字幕抓取/robust_rmtree），
+  deploy.ps1 报错按行号修。
+
+### 验证数据
+- mimosa audit --deep 高危 30→0（跨文件入口告警同清零）；全量 784 passed
+  / 21 skipped（环境性跳过），每步零回归。
+
+### 教训（本轮真实踩坑）
+- 一次 Write 长输出损坏（公式错/字段重复）被自查发现，按 p5 原文逐行核对
+  重写——长内容落盘后必须编译 + 测试兜底。
+- commit heredoc 在本环境会被搞坏（_lc 解析错误 → 空消息），改用 -F 消息文件。
+- colima「10 分钟零输出」是 `| tail` 管道缓冲假象，错杀过一次健康启动；
+  判定后台任务卡死要看磁盘/日志实据，不看输出静默。
+
+### 同步提交（本段）
+- 5bd2e1d fix(dvpack): sockaddr_in 按平台挑视图，修复 Linux LAN 枚举
+- d4be73c fix(dvpack): Mimosa L3 全量高危清零——SSRF/路径写/XXE 加固
+- 3383a00 docs(infuse): Infuse 静态学习笔记
+- a867522 fix(dvpack): dvcC 位域注释纠偏 + 字幕头段不随 0 时长首 cue 丢失
+- 8120704 feat(dvpack): DV 信令位域收拢到 dvconfig——唯一实现
+- （本 HANDOFF 提交推送后，PR #2 自动纳入）

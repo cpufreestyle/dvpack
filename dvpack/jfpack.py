@@ -163,8 +163,7 @@ def _decode_subtitle(payload: bytes, codec: str) -> str:
         handle, temp_path = tempfile.mkstemp(suffix=f".{name}")
         os.close(handle)
         try:
-            with open(temp_path, "wb") as fh:
-                fh.write(payload)
+            Path(temp_path).write_bytes(payload)
             proc = _run(
                 [
                     str(require(FFMPEG)),
