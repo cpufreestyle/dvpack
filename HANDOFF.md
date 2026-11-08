@@ -1,3 +1,86 @@
+# HANDOFF v30 (2026-11-08 22:00) — 「还是卡着」定案为 Mac 2.4GHz WiFi 带宽；字幕两项优化已落；迁移 .68 待到位
+
+## 一句话结论
+**卡顿不是 dvpack 代码问题，是 Mac 笔记本 2.4GHz WiFi 吞吐不够。**
+serve 进程健康、ATV 能连、包能解——瓶颈在 Mac 那一跳无线的 5 Mbps。
+
+## 决定性证据（2026-11-08 21:0x 现场）
+1. `system_profiler SPAirPortDataType`：Mac 挂在 **Channel 1 (2GHz, 20MHz)**，
+   Signal/Noise `-48 dBm / -87 dBm`（SNR 39 dB，信号本身不弱）——是容量不是信号。
+2. `/tmp/dvpack-serve.log` 实测分片速率：
+   - `sent video44.m4s 13192404B in 21.02s (5.0 Mbps)`
+   - `sent video45.m4s 20497662B in 0.50s (328.9 Mbps)` ← 同段落已缓存/本地命中，反差极大
+   4K DV 需持续 20~50 Mbps，5 Mbps 必然缓冲饥饿 → 20 秒左右卡死。
+3. `Request timed out` 累计 **59 次**，几乎全部来自 `192.168.1.100`（ATV 拉 Mac 的流）。
+4. `.68` 的 Jellyfin `8096` 回 302（活着）；ATV `192.168.1.100` ping 通。
+   ⇒ 局域网与 .68 都正常，问题只在 Mac 的无线出口。
+
+## 网络拓扑现状（重要，交接必读）
+- **Mac 当前 IP 是 `192.168.1.115`**（又漂了，历史值 .109 / .106 / .115）。
+  dvplay 的 `dvplay.lastURL.v3` 写死 `http://192.168.1.109:8899/master.m3u8` 已失效，
+  真正能用的是 `pack.host = @auto`（它会扫 192.168.1.x:8899 自己发现）。
+- Mac 三个以太网口 `en4/en5/en6` 全部 `Current: none`（**没插网线**）。
+  插网线是当前最快的解法，不用改一行代码。
+- `.68` 是有线网，把 dvpack 部署过去能彻底绕开 Mac 这一跳；
+  但 ATV 自己若仍在 2.4GHz，最后一段仍是瓶颈（会好转，不一定完全消失）。
+
+## 本轮落地（已提交、已推送、测试全绿）
+分支 `fix/lan-address`，HEAD `e254079`。
+
+- `d8efbc6` 并入 11-07/11-08 全部未提交改动（serve 并段续播、bmff/jfpack/remux、
+  DV 信令、字幕头段），作为迁移基线。
+- `e254079` 字幕两项优化：
+  - `dvpack/subs.py` 新增 `_dedupe_en_cues`：`en` 轨合并重叠/重复 cue，
+    解决「英文字幕重复两行、飘在屏幕中部」的现场问题。
+  - `dvpack/serve.py` 新增 `_has_chinese`：`_online_subs_body` 在片名含 CJK 时
+    直接返回「中文视频，跳过字幕」，不烧公网、不落负缓存。
+  - `tests/test_serve.py` 那条用「真片名」的用例改成英文名，保留它原本要验的
+    「直传片名不查 /Items」意图。
+
+### 验证数据
+- `.venv/bin/python -m pytest tests/ -q` → **824 passed / 19 skipped / 0 failed**（24.4s）。
+- `py_compile dvpack/subs.py dvpack/serve.py` 通过。
+- 已 `git push origin fix/lan-address`（`d8efbc6..e254079`）。
+
+## 未闭环（明示，勿当已过）
+- **真机复验未做**：本轮只跑离线测试。DV 徽标亮不亮、是否过 20 秒仍在推进，
+  都要等 Mac 换有线/5GHz 或部署到 .68 之后才能判。
+- **`deploy.ps1` 从未在真 Windows 跑过**（编写机无 PowerShell）。首次真机报错
+  按行号修。
+- **`tools/` 是 gitignored**：Windows 二进制（`ffmpeg.exe` 161MB、`ffprobe.exe`
+  161MB、`dovi_tool.exe` 3.2MB）和 `subfetch.py`、Bento4 一套都不在 git 里。
+  `.68` 上 `git clone` 出来 `tools/` 会缺东西——必须从 Mac 整目录拷过去。
+  这是迁移最容易踩的坑。
+- **字幕去重只对 `en` 生效**，中文轨保持原样（用户口径：中文不需要字幕，
+  但已有中文轨不主动删）。OpenSubtitles 的 key 由用户提供
+  （`4kQhoCbBVA1b2Aizgi1GpDQKb9V7qR9U`），部署时写进
+  `~/.dvpack/config.json` 或 `python -m dvpack config --os-key <key>`。
+- **磁盘**：`_out/dv_p7_fix/_jf` 占 48G，根盘剩 152G。迁到 .68 后 Mac 这份可以清。
+
+## 下一步（按优先级）
+1. **插网线**（`en4/en5/en6` 任一口）→ ATV 重放同一部片，看是否过 20 秒。
+   这是零改动验证「WiFi 是瓶颈」的最快路径。
+2. 或 **Mac 与 ATV 同时切 5GHz**，再测一次。
+3. 或 **把 dvpack 部署到 .68**（根治）：
+   ```powershell
+   git clone -b fix/lan-address https://github.com/cpufreestyle/dvpack.git C:\dvpack
+   cd C:\dvpack
+   .\scripts\deploy.ps1 -JfBase http://192.168.1.68:8096 -JfUser root -JfPassword 135790 -Port 8899
+   ```
+   记住先把 Mac 的 `tools/` 整目录拷进 `C:\dvpack\tools\`。
+4. 部署后在 ATV 的 dvplay 里把 `pack.host` 设为 `192.168.1.68:8899`。
+5. 验收三盯点：DV 徽标亮 / 时间码过 00:20 且持续推进 / `.68` 的
+   `logs/serve.log` 持续 `sent video*.m4s` 且无 `Request timed out`。
+
+## 排障速查（本次沉淀）
+- 判断 serve 活没活：`curl -o /dev/null -w '%{http_code}' http://<ip>:8899/`
+  → **404 就是活的**（dvpack 只认具体路径）。
+- 判断是不是带宽问题：grep `sent video` 看单分片耗时，换算 Mbps。
+  低于 20 Mbps 就是吞吐不足，别再改代码。
+- `ConnectionResetError: [Errno 54]` / `BrokenPipeError` 在 serve 日志里
+  通常只是 AVPlayer 主动断连，不是故障。
+- `Request timed out` 出现即说明客户端等不到数据，优先查链路不查逻辑。
+
 # HANDOFF v28 (2026-10-03 16:20) -- 流媒体无法播放根因：master 的 CODECS 写了 dvh1（-11848 / -15517）；改 hvc1 + SUPPLEMENTAL-CODECS
 
 ## 决定性证据链
