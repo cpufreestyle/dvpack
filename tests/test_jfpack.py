@@ -258,7 +258,7 @@ def test_pack_redirects_to_absolute_master(pack_site):
 @pytest.mark.parametrize(
     ("requested", "expected"),
     [
-        ("0", INSTANT_PACK_SECONDS),  # 0=全片：先秒开 20s，全片后台补
+        ("0", INSTANT_PACK_SECONDS),  # 0=全片：先秒开预览段，全片后台补
         ("-5", 1.0),
         ("99999", WARM_PACK_SECONDS),  # 夹到上限后再受 warm 封顶
         ("30", 30.0),  # 区间内原样

@@ -11,8 +11,10 @@ import ipaddress
 import errno
 import json
 import os
+import time
 import subprocess
 import sys
+from types import SimpleNamespace
 from pathlib import Path
 
 import pytest
@@ -25,6 +27,7 @@ from dvpack.serve import (
     ByteRange,
     _is_private_ipv4,
     lan_address,
+    _open_ended_range,
     parse_range,
     serve,
     stream_file,
@@ -56,6 +59,49 @@ def test_parse_range(header, length, expected):
 
 def test_byte_range_length_is_inclusive():
     assert ByteRange(3, 5).length == 3
+
+
+def test_open_ended_range_detection():
+    """只有「bytes=X-」这种不带上界的才算开区间；有界区间一律不算。"""
+    assert _open_ended_range("bytes=100-")
+    assert _open_ended_range("bytes=0-")
+    assert not _open_ended_range("bytes=100-500")
+    assert not _open_ended_range("bytes=-500")  # 末尾 N 字节是有界的
+    assert not _open_ended_range(None)
+    assert not _open_ended_range("")
+
+
+def test_open_ended_range_is_capped(monkeypatch):
+    """开区间请求被截成有界段，Content-Range 仍如实描述真正发了多少。"""
+    monkeypatch.setattr(serve_module, "MAX_OPEN_RANGE_SEND", 2048)
+    length = 10 * 1024 * 1024
+    verdict, rng = parse_range("bytes=1024-", length)
+    assert verdict == PARTIAL
+    assert rng == ByteRange(1024, length - 1)
+    capped_end = rng.start + serve_module.MAX_OPEN_RANGE_SEND - 1
+    assert capped_end == 1024 + 2047
+    # 截断后的区间长度正好是上限，且不越界
+    assert ByteRange(rng.start, capped_end).length == 2048
+    assert capped_end < length
+
+
+def test_open_ended_range_cap_disabled_by_zero(monkeypatch):
+    """上限设 0 时照单全收（恢复旧行为）。
+
+    截断闸门是 `MAX_OPEN_RANGE_SEND > 0`：0 时 capped_end 会退化成
+    start-1（比 start 还小），靠这道闸门挡住，而不是靠数值比较。
+    """
+    monkeypatch.setattr(serve_module, "MAX_OPEN_RANGE_SEND", 0)
+    length = 10 * 1024 * 1024
+    _verdict, rng = parse_range("bytes=1024-", length)
+    assert not (serve_module.MAX_OPEN_RANGE_SEND > 0)
+    assert rng == ByteRange(1024, length - 1)  # 原样照单全收
+
+
+def test_bounded_range_is_never_capped():
+    """有界区间是客户端点名要的确切字节，判据上就不该被截。"""
+    assert not _open_ended_range("bytes=1024-9999999")
+    assert not _open_ended_range("bytes=-2048")
 
 
 @pytest.fixture
@@ -561,3 +607,444 @@ class TestWindowsCompat:
         monkeypatch.setattr(serve_module, "_pid_alive_nt", lambda pid: pid == 4242)
         assert serve_module._pid_alive(4242) is True
         assert serve_module._pid_alive(os.getpid()) is False
+
+
+def _pack_playlist_type(monkeypatch, **kw):
+    """跑一趟 pack_source（探测链全假），只为了看 playlist_type 有没有到 hls_command。"""
+    from dvpack import jfpack
+    seen = {}
+
+    def spy(*a, **kwargs):
+        seen.update(kwargs)
+        return ["ffmpeg"]
+
+    class _Proc:
+        stderr = ""
+
+    monkeypatch.setattr(jfpack, "ffmpeg_visible_source", lambda src: src)
+    monkeypatch.setattr(jfpack, "ffprobe_json", lambda src: {})
+    monkeypatch.setattr(jfpack, "parse_probe_json",
+                        lambda payload, path: SimpleNamespace(duration=120.0))
+    monkeypatch.setattr(jfpack, "mvp_verdict", lambda source: SimpleNamespace(supported=True))
+    monkeypatch.setattr(jfpack, "audio_pack_mode", lambda s, m: (m, "aac", False))
+    monkeypatch.setattr(jfpack, "source_full_range", lambda source: 0)
+    monkeypatch.setattr(jfpack, "_source_colorimetry", lambda source: None)
+    monkeypatch.setattr(jfpack, "dv_signalling_bsf", lambda source: ())
+    monkeypatch.setattr(jfpack, "setts_bsf", lambda source: None)
+    monkeypatch.setattr(jfpack, "hls_command", spy)
+    monkeypatch.setattr(jfpack, "_run", lambda *a, **k: _Proc())
+    with pytest.raises(jfpack.JfPackError):
+        jfpack.pack_source("http://127.0.0.1/x.mkv?static=true", "/tmp/x", **kw)
+    return seen.get("playlist_type")
+
+
+def _playlist(entries, *, event=False, endlist=False):
+    """按 ffmpeg hls muxer 的形状造一份媒体列表。"""
+    lines = ["#EXTM3U", "#EXT-X-VERSION:7", "#EXT-X-TARGETDURATION:6",
+             "#EXT-X-MEDIA-SEQUENCE:0"]
+    lines.append("#EXT-X-PLAYLIST-TYPE:EVENT" if event else "#EXT-X-PLAYLIST-TYPE:VOD")
+    lines.append('#EXT-X-MAP:URI="init.mp4"')
+    for extinf, uri in entries:
+        lines += ["#EXTINF:%.6f," % extinf, uri]
+    if endlist:
+        lines.append("#EXT-X-ENDLIST")
+    return "\n".join(lines) + "\n"
+
+
+class TestStubGrowthPlayback:
+    """秒开 stub 并段续播：真机症状「片子只能放 20 秒」的服务端半边成因。
+
+    链路是 _align_stub_to_full_pack（对齐+开环）→ _grow_playback（并段）。
+    任一半断了，电视都停在 20 秒处，而 serve 日志一片安静。
+    """
+
+    def _stub(self, tmp_path, entries):
+        out = tmp_path / "_jf" / "i1"
+        out.mkdir(parents=True)
+        (out / "init.mp4").write_bytes(b"INIT-SHARED")
+        (out / "master.m3u8").write_text("#EXTM3U\n", encoding="utf-8")
+        (out / "video.m3u8").write_text(_playlist(entries, endlist=True), encoding="utf-8")
+        (out / "source.json").write_text(
+            json.dumps({"src": "x", "seconds": 20.0}), encoding="utf-8")
+        return out
+
+    def test_align_drops_truncated_tail_and_opens_loop(self, tmp_path):
+        """20s 源打出 6/6/6/2.173：砍 2.173 那段，同时把 VOD 翻成 EVENT。"""
+        out = self._stub(tmp_path, [(6.0, "video0.m4s"), (6.0, "video1.m4s"),
+                                    (6.0, "video2.m4s"), (2.173, "video3.m4s")])
+        assert serve_module._align_stub_to_full_pack(out) == 3
+        text = (out / "video.m3u8").read_text(encoding="utf-8")
+        assert "#EXT-X-ENDLIST" not in text
+        assert "#EXT-X-PLAYLIST-TYPE:EVENT" in text
+        assert serve_module._playlist_entries(text) == [
+            (6.0, "video0.m4s"), (6.0, "video1.m4s"), (6.0, "video2.m4s")]
+
+    def test_align_is_idempotent(self, tmp_path):
+        """已经对齐又已开环：再调一次返回原段数、一个字节都不改盘。"""
+        out = self._stub(tmp_path, [(6.0, "video0.m4s"), (6.0, "video1.m4s"),
+                                    (6.0, "video2.m4s"), (2.173, "video3.m4s")])
+        serve_module._align_stub_to_full_pack(out)
+        before = (out / "video.m3u8").read_bytes()
+        assert serve_module._align_stub_to_full_pack(out) == 3
+        assert (out / "video.m3u8").read_bytes() == before
+
+    def test_align_keeps_single_segment_but_still_opens(self, tmp_path):
+        """只有一段时不能砍空（保底留一段），但开环照样要做。"""
+        out = self._stub(tmp_path, [(2.0, "video0.m4s")])
+        assert serve_module._align_stub_to_full_pack(out) == 1
+        text = (out / "video.m3u8").read_text(encoding="utf-8")
+        assert "#EXT-X-ENDLIST" not in text
+        assert serve_module._playlist_entries(text) == [(2.0, "video0.m4s")]
+
+    def test_align_prefix_is_strict_prefix_of_full_pack(self, tmp_path):
+        """砍完的 stub 必须是全片包的严格前缀——并段接缝长度为零的前提。"""
+        full = [(6.0, "video%d.m4s" % n) for n in range(6)]
+        out = self._stub(tmp_path, full[:3] + [(2.173, "video3.m4s")])
+        kept = serve_module._align_stub_to_full_pack(out)
+        assert serve_module._playlist_entries(
+            (out / "video.m3u8").read_text(encoding="utf-8")) == full[:kept]
+
+    def test_align_on_missing_playlist_is_noop(self, tmp_path):
+        out = tmp_path / "_jf" / "i1"
+        out.mkdir(parents=True)
+        assert serve_module._align_stub_to_full_pack(out) == 0
+        assert not (out / "video.m3u8").exists()
+
+    def test_open_stub_if_needed_opens_stub_marker(self, tmp_path):
+        out = self._stub(tmp_path, [(6.0, "video0.m4s"), (6.0, "video1.m4s")])
+        assert serve_module._open_stub_if_needed(out) is True
+        assert "#EXT-X-ENDLIST" not in (out / "video.m3u8").read_text(encoding="utf-8")
+
+    def test_open_stub_if_needed_leaves_full_pack_alone(self, tmp_path):
+        """自称全片（seconds==0）不碰：ENDLIST 是正确终态，轮询到即宣告完整。"""
+        out = self._stub(tmp_path, [(6.0, "video0.m4s"), (6.0, "video1.m4s")])
+        (out / "source.json").write_text(
+            json.dumps({"src": "x", "seconds": 0.0, "plen": 120.0}), encoding="utf-8")
+        before = (out / "video.m3u8").read_bytes()
+        assert serve_module._open_stub_if_needed(out) is False
+        assert (out / "video.m3u8").read_bytes() == before
+
+    def test_open_stub_if_needed_leaves_poisoned_pack_alone(self, tmp_path):
+        """毒包要走自愈重打，开环只会让坏包播得更久。"""
+        out = self._stub(tmp_path, [(6.0, "video0.m4s")] * 3)
+        (out / "source.json").write_text(json.dumps(
+            {"src": "x", "seconds": 0.0, "plen": 1200.0}), encoding="utf-8")
+        before = (out / "video.m3u8").read_bytes()
+        assert serve_module._open_stub_if_needed(out) is False
+        assert (out / "video.m3u8").read_bytes() == before
+
+
+class TestSealedPrefix:
+    def test_holds_back_in_flight_segment(self, tmp_path):
+        """最后那一项往往还在写：分片文件数 - 1 才是可发布前缀。"""
+        for n in range(5):
+            (tmp_path / ("video%d.m4s" % n)).write_bytes(b"x")
+        (tmp_path / "video.m3u8").write_text(_playlist(
+            [(6.0, "video%d.m4s" % n) for n in range(5)], endlist=True), encoding="utf-8")
+        entries, sealed = serve_module._sealed_prefix(tmp_path)
+        assert sealed == 4
+        assert entries == [(6.0, "video%d.m4s" % n) for n in range(4)]
+
+    def test_no_segments_yet_is_zero(self, tmp_path):
+        (tmp_path / "video.m3u8").write_text(_playlist([(6.0, "video0.m4s")]), encoding="utf-8")
+        assert serve_module._sealed_prefix(tmp_path) == ([], 0)
+
+    def test_missing_playlist_is_zero(self, tmp_path):
+        assert serve_module._sealed_prefix(tmp_path) == ([], 0)
+
+
+class TestGrowPlayback:
+    def _packs(self, tmp_path):
+        out = tmp_path / "_jf" / "i1"
+        out.mkdir(parents=True)
+        (out / "init.mp4").write_bytes(b"INIT-SHARED")
+        (out / "video.m3u8").write_text(_playlist(
+            [(6.0, "video%d.m4s" % n) for n in range(3)], event=True), encoding="utf-8")
+        full = tmp_path / "._upgrade_i1_1"
+        full.mkdir(parents=True)
+        (full / "init.mp4").write_bytes(b"INIT-SHARED")
+        for n in range(6):
+            (full / ("video%d.m4s" % n)).write_bytes(b"seg%d" % n)
+        (full / "video.m3u8").write_text(_playlist(
+            [(6.0, "video%d.m4s" % n) for n in range(6)], endlist=True), encoding="utf-8")
+        return full, out
+
+    def _run_until(self, full, out, want):
+        import threading
+        stop = threading.Event()
+        thread = threading.Thread(target=serve_module._grow_playback,
+                                  args=(full, out, stop, "i1"), daemon=True)
+        thread.start()
+        try:
+            deadline = time.monotonic() + 10.0
+            while time.monotonic() < deadline:
+                entries = serve_module._playlist_entries(
+                    (out / "video.m3u8").read_text(encoding="utf-8"))
+                if len(entries) >= want:
+                    return entries
+                time.sleep(0.05)
+            raise AssertionError("并段没到 %d 段：%r" % (want, entries))
+        finally:
+            stop.set()
+            thread.join(timeout=5.0)
+
+    def test_publishes_sealed_prefix_into_live_pack(self, tmp_path):
+        full, out = self._packs(tmp_path)
+        entries = self._run_until(full, out, 5)
+        assert entries == [(6.0, "video%d.m4s" % n) for n in range(5)]
+        # 分片是真复制过来的，不是只改列表
+        assert (out / "video4.m4s").read_bytes() == b"seg4"
+        assert "#EXT-X-ENDLIST" not in (out / "video.m3u8").read_text(encoding="utf-8")
+
+    def test_different_init_aborts_growth(self, tmp_path):
+        """init 不一致 = 两套参数集：并段就是把解不动的分片喂给电视，必须整体退化成等换装。"""
+        full, out = self._packs(tmp_path)
+        (full / "init.mp4").write_bytes(b"INIT-OTHER")
+        import threading
+        stop = threading.Event()
+        thread = threading.Thread(target=serve_module._grow_playback,
+                                  args=(full, out, stop, "i1"), daemon=True)
+        thread.start()
+        thread.join(timeout=5.0)
+        assert not thread.is_alive()
+        assert not (out / "video3.m4s").exists()
+        assert len(serve_module._playlist_entries(
+            (out / "video.m3u8").read_text(encoding="utf-8"))) == 3
+
+    def test_never_shrinks_the_live_playlist(self, tmp_path):
+        """全片包刚开写时 tmp 里只有 1~2 段，绝不能把 3 段的在播列表砍短。
+
+        2026-11-07 真机采样抓到 3→2→4：播放器正握着第 3 段，列表一短它就断。
+        发布量的起点必须是在播列表已有的段数，不是 0。
+        """
+        full, out = self._packs(tmp_path)
+        # 只留 2 段的全片包：模拟 ffmpeg 刚开写的那个瞬间
+        for n in range(2, 6):
+            (full / ("video%d.m4s" % n)).unlink()
+        (full / "video.m3u8").write_text(_playlist(
+            [(6.0, "video%d.m4s" % n) for n in range(2)], endlist=True), encoding="utf-8")
+        import threading
+        stop = threading.Event()
+        thread = threading.Thread(target=serve_module._grow_playback,
+                                  args=(full, out, stop, "i1"), daemon=True)
+        thread.start()
+        thread.join(timeout=5.0)
+        stop.set()
+        thread.join(timeout=5.0)
+        entries = serve_module._playlist_entries(
+            (out / "video.m3u8").read_text(encoding="utf-8"))
+        assert len(entries) == 3, "在播列表被砍短了：%r" % (entries,)
+
+    def test_publishes_only_forward(self, tmp_path):
+        """并段过程中在播列表长度单调不减（真机采样断言同款）。"""
+        full, out = self._packs(tmp_path)
+        seen = []
+        import threading
+        stop = threading.Event()
+
+        def watcher():
+            while not stop.is_set():
+                seen.append(len(serve_module._playlist_entries(
+                    (out / "video.m3u8").read_text(encoding="utf-8"))))
+                stop.wait(0.02)
+
+        threading.Thread(target=watcher, daemon=True).start()
+        self._run_until(full, out, 5)
+        stop.set()
+        assert seen, "没采到样"
+        assert all(b >= a for a, b in zip(seen, seen[1:])), "在播列表变短：%s" % seen
+        assert seen[-1] >= 5
+
+
+def _bmff_box(btype: str, payload: bytes) -> bytes:
+    return (len(payload) + 8).to_bytes(4, "big") + btype.encode("latin-1") + payload
+
+
+def _bmff_full_box(btype: str, payload: bytes) -> bytes:
+    return _bmff_box(btype, b"\0\0\0\0" + payload)
+
+
+def _bmff_param_set_array(nal_type: int, *nals: bytes, complete: bool = True) -> bytes:
+    out = bytes([(0xA0 if complete else 0x00) | nal_type]) + len(nals).to_bytes(2, "big")
+    for nal in nals:
+        out += len(nal).to_bytes(2, "big") + nal
+    return out
+
+
+def _bmff_dvh1(*arrays: bytes) -> bytes:
+    """dvh1 sample entry：78 字节 VisualSampleEntry 固定字段 + 子盒（只放 hvcC）。"""
+    hvcC = _bmff_box("hvcC", bytes(22) + len(arrays).to_bytes(1, "big") + b"".join(arrays))
+    return _bmff_box("dvh1", bytes(78) + hvcC)
+
+
+def _bmff_init(*entries: bytes) -> bytes:
+    """最小可解析 init 段：ftyp + moov/trak/mdia/minf/stbl/stsd。"""
+    stsd = _bmff_full_box("stsd", len(entries).to_bytes(4, "big") + b"".join(entries))
+    # hdlr 载荷：version/flags(4) + predefined(4) + handler_type(4)，少一段
+    # _handler 就从 offset+16 起读不到 handler，签名直接判「解析不了」。
+    hdlr = _bmff_full_box("hdlr", b"\0\0\0\0" + b"\0\0\0\0" + b"vide")
+    mdia = _bmff_box("mdia", hdlr + _bmff_box("minf", _bmff_box("stbl", stsd)))
+    return _bmff_box("ftyp", b"iso5") + _bmff_box("moov", _bmff_box("trak", mdia))
+
+
+class TestGrowPlaybackInitGate:
+    """并段闸门判「同一套可解码流」，不是「同一个字节串」。
+
+    2026-11-08 真机症状「播放卡住」的根因：20 秒秒开 stub 与全片后台包的 init
+    只差 movenc 追加的第二个 dvh1 entry、hvcC 数组 completeness 标志、多出来的
+    前缀 SEI(39) 数组。逐字节判把这种包整体放弃并段，电视停在 20 秒处转圈。
+    """
+
+    _VPS = b"\x40\x01\x0c\x01\xff\xff\x02\x20\x00\x00\x03\x00"
+    _SPS = b"\x42\x01\x01\x02\x20\x00\x00\x03\x00\x90\x00\x00\x03\x00\x00\x03\x00"
+    _PPS = b"\x44\x01\xc1\x72\xc8\x46\x92\xfc\x90"
+    _SEI39 = b"\x4e\x01\x81\x01\x03\x80"
+
+    def _mandatory(self, *, complete: bool) -> list[bytes]:
+        return [_bmff_param_set_array(32, self._VPS, complete=complete),
+                _bmff_param_set_array(33, self._SPS, complete=complete),
+                _bmff_param_set_array(34, self._PPS, complete=complete)]
+
+    def _packs(self, tmp_path, *, stub_init: bytes, full_init: bytes):
+        out = tmp_path / "_jf" / "i1"
+        out.mkdir(parents=True)
+        (out / "init.mp4").write_bytes(stub_init)
+        (out / "video.m3u8").write_text(_playlist(
+            [(6.0, "video%d.m4s" % n) for n in range(3)], event=True), encoding="utf-8")
+        full = tmp_path / "._upgrade_i1_1"
+        full.mkdir(parents=True)
+        (full / "init.mp4").write_bytes(full_init)
+        for n in range(6):
+            (full / ("video%d.m4s" % n)).write_bytes(b"seg%d" % n)
+        (full / "video.m3u8").write_text(_playlist(
+            [(6.0, "video%d.m4s" % n) for n in range(6)], endlist=True), encoding="utf-8")
+        return full, out
+
+    def test_grows_when_init_differs_only_in_undecodable_ways(self, tmp_path):
+        """entry 数量 / completeness 标志 / 前缀 SEI 数组不同，但参数集相同：放行。"""
+        stub = _bmff_init(_bmff_dvh1(*self._mandatory(complete=True)))
+        full = _bmff_init(
+            _bmff_dvh1(*self._mandatory(complete=False),
+                       _bmff_param_set_array(39, self._SEI39, complete=False)),
+            _bmff_dvh1(*self._mandatory(complete=False)),
+        )
+        assert stub != full
+        full_dir, out = self._packs(tmp_path, stub_init=stub, full_init=full)
+        import threading
+        stop = threading.Event()
+        thread = threading.Thread(target=serve_module._grow_playback,
+                                  args=(full_dir, out, stop, "i1"), daemon=True)
+        thread.start()
+        try:
+            deadline = time.monotonic() + 10.0
+            while time.monotonic() < deadline:
+                entries = serve_module._playlist_entries(
+                    (out / "video.m3u8").read_text(encoding="utf-8"))
+                if len(entries) >= 5:
+                    break
+                time.sleep(0.05)
+        finally:
+            stop.set()
+            thread.join(timeout=5.0)
+        assert len(entries) >= 5, "并段被字节差异误杀：%r" % (entries,)
+        assert (out / "video4.m4s").read_bytes() == b"seg4"
+
+    def test_aborts_when_parameter_sets_really_differ(self, tmp_path):
+        """参数集内容不同 = 两套解码能力：仍然必须整体退化成等换装。"""
+        other_sps = self._SPS[:-1] + b"\x01"
+        stub = _bmff_init(_bmff_dvh1(*self._mandatory(complete=True)))
+        full = _bmff_init(_bmff_dvh1(
+            _bmff_param_set_array(32, self._VPS, complete=False),
+            _bmff_param_set_array(33, other_sps, complete=False),
+            _bmff_param_set_array(34, self._PPS, complete=False),
+        ))
+        full_dir, out = self._packs(tmp_path, stub_init=stub, full_init=full)
+        import threading
+        stop = threading.Event()
+        thread = threading.Thread(target=serve_module._grow_playback,
+                                  args=(full_dir, out, stop, "i1"), daemon=True)
+        thread.start()
+        thread.join(timeout=5.0)
+        stop.set()
+        thread.join(timeout=5.0)
+        assert not (out / "video3.m4s").exists()
+        assert len(serve_module._playlist_entries(
+            (out / "video.m3u8").read_text(encoding="utf-8"))) == 3
+
+
+class TestCopyAtomic:
+    def test_open_reader_keeps_old_inode(self, tmp_path):
+        """AVPlayer 随时可能正在读 dst；os.replace 保证它握着的旧 fd 不被打断。"""
+        src, dst = tmp_path / "src", tmp_path / "dst"
+        src.write_bytes(b"new-bytes")
+        dst.write_bytes(b"old-bytes")
+        with dst.open("rb") as reader:
+            serve_module._copy_atomic(src, dst)
+            assert reader.read() == b"old-bytes"
+        assert dst.read_bytes() == b"new-bytes"
+        assert not (tmp_path / "dst.growing").exists()
+
+    def test_unreadable_source_leaves_dst_intact(self, tmp_path):
+        src, dst = tmp_path / "src", tmp_path / "dst"
+        dst.write_bytes(b"old-bytes")
+        with pytest.raises(OSError):
+            serve_module._copy_atomic(src, dst)
+        assert dst.read_bytes() == b"old-bytes"
+
+
+class TestSealFullPlaylist:
+    """全片包用 EVENT 打、换装前收回 VOD+ENDLIST。
+
+    少了 EVENT，ffmpeg 直到进程退出才写 video.m3u8，grower 全程空转，
+    续播退化回「只能放 20 秒」；少了收回，电视拿到一份永无止境的 EVENT
+    列表，播完也不收场。
+    """
+
+    def test_event_is_sealed_to_vod_with_endlist(self, tmp_path):
+        (tmp_path / "video.m3u8").write_text(_playlist(
+            [(6.0, "video%d.m4s" % n) for n in range(4)], event=True), encoding="utf-8")
+        assert serve_module._seal_full_playlist(tmp_path) == 4
+        text = (tmp_path / "video.m3u8").read_text(encoding="utf-8")
+        assert "#EXT-X-PLAYLIST-TYPE:VOD" in text
+        assert "#EXT-X-ENDLIST" in text
+        assert serve_module._playlist_entries(text) == [
+            (6.0, "video%d.m4s" % n) for n in range(4)]
+
+    def test_already_vod_is_left_alone(self, tmp_path):
+        before = _playlist([(6.0, "video0.m4s")], endlist=True)
+        (tmp_path / "video.m3u8").write_text(before, encoding="utf-8")
+        assert serve_module._seal_full_playlist(tmp_path) == 1
+        assert (tmp_path / "video.m3u8").read_text(encoding="utf-8") == before
+
+    def test_missing_playlist_is_zero(self, tmp_path):
+        assert serve_module._seal_full_playlist(tmp_path) == 0
+
+    def test_targetduration_covers_longest_segment(self, tmp_path):
+        (tmp_path / "video.m3u8").write_text(_playlist(
+            [(6.0, "video0.m4s"), (14.4, "video1.m4s")], event=True), encoding="utf-8")
+        serve_module._seal_full_playlist(tmp_path)
+        assert "#EXT-X-TARGETDURATION:15" in (tmp_path / "video.m3u8").read_text(encoding="utf-8")
+
+
+class TestPlaylistTypePlumbing:
+    """EVENT 口径必须真的传到 ffmpeg argv，否则 grower 读不到东西。"""
+
+    def test_hls_command_defaults_to_vod(self):
+        from dvpack.remux import hls_command
+        argv = hls_command(Path("in.mkv"), Path("out.m3u8"))
+        assert argv[argv.index("-hls_playlist_type") + 1] == "vod"
+
+    def test_hls_command_accepts_event(self):
+        from dvpack.remux import hls_command
+        argv = hls_command(Path("in.mkv"), Path("out.m3u8"), playlist_type="event")
+        assert argv[argv.index("-hls_playlist_type") + 1] == "event"
+
+    def test_pack_source_passes_playlist_type_through(self, monkeypatch):
+        """EVENT 必须真的走到 hls_command——少这一跳 grower 就读不到已封段。"""
+        assert _pack_playlist_type(monkeypatch, playlist_type="event") == "event"
+
+    def test_pack_source_defaults_to_vod(self, monkeypatch):
+        """秒开 stub 仍走 VOD：定长包 + ENDLIST，电视不会守着它等追加。"""
+        assert _pack_playlist_type(monkeypatch) == "vod"
+
+

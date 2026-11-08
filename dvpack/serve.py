@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import ctypes
 import errno
+import math
 import os
 import socket
 import shutil
@@ -31,6 +32,7 @@ import threading
 from urllib.parse import parse_qs, urlsplit
 
 from .jfpack import JfPackError, pack_source
+from .bmff import init_stream_compatible
 from .p5 import ResignError
 from .probe import NotProbeable
 from .remux import FFMPEG, VIDEO_AUDIO_MAPS, VIDEO_ONLY_MAPS, RemuxError
@@ -71,6 +73,13 @@ WARM_PACK_SECONDS = 180.0
 # 要拉 750MB，实测 20s+ 才落 playlist，AVPlayer 等 302 超时就掐连接
 # （serve 日志里是 BrokenPipeError），真机症状「点片没反应/播放失败」。
 # 20 秒源约 2~4 秒出片，够播放器起播又不让它等。
+# 2026-11-07 实测：20 秒包 5s 出 302、60 秒包 14s 出 302（瓶颈是 ffmpeg
+# 启动 + Jellyfin 首字节，与时长近似线性）。9 秒的起播退化对「打开速度」
+# 不划算，故保持 20 秒；「只有 20 秒」改由客户端在 stub 结束时探测
+# playlist 是否变长、全片换装完成后 seek 续播解决（dvplay PlayerModel）。
+# 2026-11-07 修正：续播已完全落在服务端——stub 砍掉截断尾段后开环成 EVENT，
+# 全片打包期间 _grow_playback 把已封段逐个并进在播包（见
+# _align_stub_to_full_pack）。客户端不需要自己 seek，之前那条作废。
 INSTANT_PACK_SECONDS = 20.0
 
 # pack_source 的已知失败面。catch 不全就会炸穿连接——真链路实测过：
@@ -296,6 +305,158 @@ def _sweep_stale_swaps(parent: Path) -> int:
     return swept
 
 
+_GROW_POLL_SECONDS = 1.5
+_GROW_INIT_TIMEOUT = 120.0
+
+
+#: 开区间 Range（`bytes=X-`）单次响应最多发这么多字节。
+#:
+#: 为什么（2026-11-08 真机实测）：AVPlayer 的 resource loader 要的是「从 X
+#: 到结尾」，但它每次只消费 0.6~2MB 就把连接关掉。服务端若照单全收发
+#: 8~24MB，多出来的字节占满消费者的 TCP 接收窗口后被整体丢弃——实测
+#: video26.m4s 服务端发了 40.6MB、消费者前进了 8.77MB，**4.6 倍空转**。
+#: 而那条链路的真实吞吐只有 4.8~6.5 Mbps（Mac Wi-Fi 2.4GHz），空转直接
+#: 把可用的内容吞吐吃到 1/5，真机症状就是「一直卡住/转圈」。
+#:
+#: 截成有界区间后，消费者拿满一段再要下一段，链路利用率回到接近 1:1。
+#: Content-Range 如实描述本段真正发了多少（`bytes X-Y/总长`），客户端据此
+#: 续要剩余部分——这一行为已被真机验证：截断前它就一直在用「 advancing
+#: offset + 开区间」逐段往前要。
+#:
+#: 0 = 不截（恢复旧的照单全收）。
+MAX_OPEN_RANGE_SEND = int(os.environ.get(
+    "DVPACK_MAX_OPEN_RANGE_SEND", 2 * 1024 * 1024))
+
+
+def _sealed_prefix(tmp: Path) -> tuple[list[tuple[float, str]], int]:
+    """全片临时目录里「已封段」的前缀，返回 (entries, sealed_count)。
+
+    ffmpeg 的 hls muxer 边编码边写：先落 videoN.m4s，再把 videoN 追加进
+    video.m3u8，然后才开写 videoN+1。所以磁盘上存在 videoN+1.m4s 就说明
+    videoN.m4s 已经写完；列表里最后那一项对应的分片往往还在写。取
+    「分片文件数 - 1」与「列表项数」的较小值，就是可以安全发布的前缀。
+    """
+    playlist = tmp / "video.m3u8"
+    try:
+        text = playlist.read_text(encoding="utf-8")
+    except OSError:
+        return [], 0
+    entries = _playlist_entries(text)
+    files = sorted(tmp.glob("video*.m4s"))
+    sealed = min(len(entries), max(0, len(files) - 1))
+    return entries[:sealed], sealed
+
+
+def _published_count(out_dir: Path, name: str = "video.m3u8") -> int:
+    """在播列表当前有几段——并段的发布下限，绝不能被砍短。
+
+    ffmpeg 刚开写全片包时，tmp 里可能只有 1~2 段；而对齐后的 stub 已经有
+    3 段。若以 0 起算，第一次并段就会把 3 段的在播列表覆盖成 2 段——播放器
+    可能正握着第 3 段，列表一短它就断（2026-11-07 真机采样 3→2→4 复现）。
+    """
+    try:
+        text = (out_dir / name).read_text(encoding="utf-8")
+    except OSError:
+        return 0
+    return len(_playlist_entries(text))
+
+
+def _init_mergeable(a: Path, b: Path) -> tuple[bool, str]:
+    """并段安全闸：两份 init 段是否同一套可解码流。返回 (结论, 不兼容原因)。
+
+    逐字节相同是充分条件、不是必要条件：ffmpeg movenc 在流中 extradata 变化时
+    会追加第二个 dvh1 entry，hvcC 的数组 completeness 标志与多出来的前缀
+    SEI(39) 数组也跟着变——2026-11-08 真机采样（de741a）20s stub 与全片包的
+    init 只差这些，VPS/SPS/PPS、dvcC、colr、音轨逐字节全同、前两个分片也逐
+    字节相同。按字节判会把这种包整体放弃并段，电视停在 20 秒处转圈（真机症状
+    「播放卡住」）。判据本身在 bmff.init_stream_compatible。
+    """
+    try:
+        left, right = a.read_bytes(), b.read_bytes()
+    except OSError as exc:
+        return False, f"读不到 init（{exc}）"
+    return init_stream_compatible(left, right)
+
+
+def _copy_atomic(src: Path, dst: Path) -> None:
+    """复制并原子落位：先写同目录临时文件再 os.replace。
+
+    AVPlayer 随时可能正在读 dst；原地覆盖会让它读到半截分片而报错。
+    """
+    tmp = dst.parent / (dst.name + ".growing")
+    with src.open("rb") as fi, tmp.open("wb") as fo:
+        while True:
+            chunk = fi.read(1 << 20)
+            if not chunk:
+                break
+            fo.write(chunk)
+    os.replace(tmp, dst)
+
+
+def _grow_playback(tmp: Path, out_dir: Path, stop: "threading.Event",
+                   item_id: str) -> None:
+    """全片打包期间把已封段并进在播包，让播放不中断。
+
+    为什么（2026-11-07）：秒开 stub 只有约 18 秒，全片打包要 4~13 分钟。
+    开环（EVENT、无 ENDLIST）只解决「AVPlayer 肯继续轮询」，解决不了
+    「这十几分钟里放什么」——不并段的话电视就停在 18 秒处一直转圈，
+    用户看到的就是「片子只能放 20 秒」。
+
+    这里按 _sealed_prefix 的口径，把全片包里已写完的分片逐个复制进在播
+    目录，并把 EVENT 列表一起改长。接缝长度为零的前提是 stub 已经
+    _trim_stub_tail 砍掉截断尾段——那样 stub 就是全片包的严格前缀，
+    播完最后一段的位置正好是全片包下一段的起点。
+
+    发布量单调不减：起点是在播列表已有的段数。全片包刚开写时 tmp 里可能
+    只有 1~2 段，若以 0 起算，第一次并段就会把 3 段的在播列表覆盖成 2 段，
+    播放器可能正握着第 3 段，列表一短它就断。
+
+    安全闸：只有两份 init.mp4 描述同一套可解码流（同一套参数集、同一套
+    dvcC、同一套色彩/音轨信令）时才并段。不同就整体退化成「等换装」，
+    绝不把解不动的分片喂给电视。判据见 _init_mergeable——逐字节相同是
+    充分条件，但不是必要条件。
+    """
+    deadline = time.monotonic() + _GROW_INIT_TIMEOUT
+    init_ok = False
+    # 发布量只能单调不减：起点是在播列表已有的段数（对齐后的 stub 通常 3 段），
+    # 不是 0。全片包刚开写时 tmp 里可能只有 2 段，以 0 起算会把在播列表砍短。
+    published = _published_count(out_dir)
+    while not stop.is_set():
+        if not init_ok:
+            if (tmp / "init.mp4").exists() and (out_dir / "init.mp4").exists():
+                init_ok, reason = _init_mergeable(
+                    tmp / "init.mp4", out_dir / "init.mp4")
+                if not init_ok:
+                    print(f"[serve] init 不兼容（{reason}），放弃并段 {item_id}",
+                          flush=True)
+                    return
+            elif time.monotonic() > deadline:
+                return
+            else:
+                time.sleep(_GROW_POLL_SECONDS)
+                continue
+        entries, sealed = _sealed_prefix(tmp)
+        # max 兜住「全片包前缀比在播列表还短」的时序：那种时刻什么都不该发。
+        # min(published, len(entries)) 防止 published 超出全片列表长度时越界。
+        publish = max(sealed, min(published, len(entries)))
+        if publish <= published:
+            if stop.wait(_GROW_POLL_SECONDS):
+                return
+            continue
+        try:
+            for _extinf, uri in entries[published:publish]:
+                seg = tmp / uri
+                if seg.is_file():
+                    _copy_atomic(seg, out_dir / uri)
+            _write_growing_playlist(out_dir, entries[:publish])
+        except OSError:
+            if stop.wait(_GROW_POLL_SECONDS):
+                return
+            continue
+        published = publish
+        print(f"[serve] 并段 {item_id} → {published} 段", flush=True)
+
+
 def _pack_full_swap(src: str, out_dir: Path, maps, texts, item_id: str) -> None:
     """全片打进兄弟临时目录，marker 落定后整体换装。
 
@@ -312,15 +473,49 @@ def _pack_full_swap(src: str, out_dir: Path, maps, texts, item_id: str) -> None:
         robust_rmtree(tmp)
     tmp.mkdir(parents=True)
     try:
-        if not _parallel_full(src, tmp, maps, texts):
-            pack_source(
-                src,
-                tmp,
-                seconds=0.0,
-                maps=maps,
-                master_uri=f"/_jf/{item_id}/video.m3u8",
-                subtitle_texts=texts,
+        # 打包期间就把已封段并进在播包：否则全片这 4~13 分钟里电视只有
+        # 约 18 秒可看，停在原地转圈——「片子只能放 20 秒」的另一半成因。
+        stop = threading.Event()
+        grower = None
+        # 并段只对单进程 pack_source 成立：parpack 的分块列表是 VOD 口径，
+        # 要等 ffmpeg 退出才落盘，grower 全程读不到已封段。并行本来就默认关着
+        # （audio tfdt 接缝偏移未修，见 _parallel_full），这里一并说清代价。
+        if (os.environ.get("DVPACK_PARALLEL") != "1"
+                and out_dir.is_dir() and (out_dir / "video.m3u8").is_file()
+                and _is_stub_pack(out_dir)):
+            # 在播的秒开 stub 先对齐成严格前缀并开环：AVPlayer 才会在打包期间
+            # 持续轮询、拿到并进来的新段接着放，而不是播完 20 秒就停。
+            # 放在起 grower 之前：stub 不开环，并进来的段也没有读者。
+            _align_stub_to_full_pack(out_dir)
+            grower = threading.Thread(
+                target=_grow_playback,
+                args=(tmp, out_dir, stop, item_id),
+                daemon=True,
+                name=f"dvpack-grow-{item_id}",
             )
+            grower.start()
+        try:
+            if not _parallel_full(src, tmp, maps, texts):
+                pack_source(
+                    src,
+                    tmp,
+                    seconds=0.0,
+                    maps=maps,
+                    master_uri=f"/_jf/{item_id}/video.m3u8",
+                    subtitle_texts=texts,
+                    # EVENT 口径打全片：ffmpeg 才会边编码边写 video.m3u8，
+                    # grower 才读得到已封段。换装前由 _seal_full_playlist
+                    # 收回 VOD + ENDLIST。
+                    playlist_type="event",
+                )
+        finally:
+            # 并段线程必须在换装前停稳：它写的是 out_dir，换装要整目录替换。
+            stop.set()
+            if grower is not None:
+                grower.join(timeout=10.0)
+        # EVENT 是「还会有更多分片」的声明，不能当终态交给电视：换装前收回
+        # VOD + ENDLIST。只改列表头，分片一个字节都不碰。
+        _seal_full_playlist(tmp)
         _write_marker(
             tmp,
             {
@@ -461,6 +656,223 @@ def _cache_fresh(out_dir: Path, src: str, seconds: float) -> bool:
     if _pack_poisoned(meta, out_dir):
         return False
     return meta.get("src") == _src_fingerprint(src) and meta.get("seconds") == seconds
+
+
+def _playlist_entries(text: str) -> list[tuple[float, str]]:
+    """解析 media playlist 的 (EXTINF, URI) 序列，忽略所有 # 注释行。"""
+    entries: list[tuple[float, str]] = []
+    pending = None
+    for line in text.splitlines():
+        if line.startswith("#EXTINF:"):
+            try:
+                pending = float(line[len("#EXTINF:"):].split(",", 1)[0])
+            except ValueError:
+                pending = None
+            continue
+        if not line or line.startswith("#"):
+            continue
+        if pending is not None:
+            entries.append((pending, line))
+            pending = None
+    return entries
+
+
+def _write_growing_playlist(out_dir: Path, entries: list[tuple[float, str]],
+                            name: str = "video.m3u8") -> None:
+    """原子写一份「还能长」的 EVENT media playlist（无 ENDLIST）。
+
+    VOD + ENDLIST 是「这份列表到此为止」的强声明，AVPlayer 拿到就不再轮询；
+    EVENT 才是「后续会追加」的口径。只改列表头，EXTINF/URI 逐行照抄，
+    不碰任何分片字节。
+    """
+    header = ["#EXTM3U", "#EXT-X-VERSION:7", "#EXT-X-INDEPENDENT-SEGMENTS",
+              "#EXT-X-TARGETDURATION:%d" % max(1, math.ceil(max(e for e, _ in entries))),
+              "#EXT-X-MEDIA-SEQUENCE:0",
+              "#EXT-X-PLAYLIST-TYPE:EVENT", "#EXT-X-MAP:URI=\"init.mp4\""]
+    body: list[str] = []
+    for extinf, uri in entries:
+        body.append(f"#EXTINF:{extinf:.6f},")
+        body.append(uri)
+    tmp = out_dir / (name + ".open")
+    tmp.write_text("\n".join(header + body) + "\n", encoding="utf-8")
+    os.replace(tmp, out_dir / name)
+
+
+def _seal_full_playlist(out_dir: Path, name: str = "video.m3u8") -> int:
+    """把 EVENT 列表收成 VOD + ENDLIST，返回段数（本就不是 EVENT 就原样返回）。
+
+    为什么（2026-11-07）：全片包必须用 EVENT 口径打，grower 才读得到「已经
+    封了哪些段」——VOD + hls_list_size 0 时 ffmpeg 直到进程退出才写
+    video.m3u8，并段线程全程空转，续播退化回「只能放 20 秒」。
+
+    但 EVENT 无 ENDLIST 是「还会有更多分片」的声明，不能当成终态交给电视：
+    换装前必须在这里收回 VOD + ENDLIST，播放器才会正常宣告播完。
+    只改列表头，EXTINF/URI 逐行照抄，分片一个字节都不碰。
+    """
+    playlist = out_dir / name
+    try:
+        text = playlist.read_text(encoding="utf-8")
+    except OSError:
+        return 0
+    entries = _playlist_entries(text)
+    if not entries:
+        return 0
+    if "#EXT-X-ENDLIST" in text and "PLAYLIST-TYPE:EVENT" not in text:
+        return len(entries)
+    header = ["#EXTM3U", "#EXT-X-VERSION:7", "#EXT-X-INDEPENDENT-SEGMENTS",
+              "#EXT-X-TARGETDURATION:%d" % max(1, math.ceil(max(e for e, _ in entries))),
+              "#EXT-X-MEDIA-SEQUENCE:0",
+              "#EXT-X-PLAYLIST-TYPE:VOD", "#EXT-X-MAP:URI=\"init.mp4\""]
+    body: list[str] = []
+    for extinf, uri in entries:
+        body.append(f"#EXTINF:{extinf:.6f},")
+        body.append(uri)
+    tmp = out_dir / (name + ".sealed")
+    tmp.write_text("\n".join(header + body + ["#EXT-X-ENDLIST"]) + "\n", encoding="utf-8")
+    os.replace(tmp, playlist)
+    return len(entries)
+
+
+def _trim_stub_tail(out_dir: Path, name: str = "video.m3u8") -> int:
+    """砍掉秒开 stub 的尾段，返回剩下的段数。
+
+    为什么（2026-11-07）：stub 是 `-t INSTANT_PACK_SECONDS` 打出来的，最后
+    一段必然被时长截断（实测 20s 源打出 6.0/6.0/6.0/2.173 四段）。全片包
+    没有这道截断，它的尾段是完整的一段。两边同一索引的段时长不同，
+    后台把全片段并进来时就会在接缝处跳走几秒——实测 20.17s 直接跳到 24s。
+
+    把截断的尾段从列表里摘掉（分片文件留着，全片包同名覆盖即可），stub 就
+    成了全片包的严格前缀：播完最后一段的位置，正好是全片包下一段的起点，
+    接缝长度为零。代价是秒开内容少一段（约 6 秒），换来续播不跳帧。
+    """
+    playlist = out_dir / name
+    try:
+        text = playlist.read_text(encoding="utf-8")
+    except OSError:
+        return 0
+    entries = _playlist_entries(text)
+    if len(entries) < 2:
+        return len(entries)
+    kept = entries[:-1]
+    try:
+        _write_growing_playlist(out_dir, kept, name)
+    except OSError:
+        return len(entries)
+    return len(kept)
+
+
+def _open_stub_playlist(out_dir: Path, name: str = "video.m3u8") -> bool:
+    """把 VOD 收尾的 stub 列表开环成 EVENT 口径，返回是否真的改过。
+
+    为什么（2026-11-07）：秒开 stub 只有 20 秒 / 4 段，全片后台换装要 4~13
+    分钟。带 `#EXT-X-ENDLIST` 的 `#EXT-X-PLAYLIST-TYPE:VOD` 列表等于同时
+    告诉 AVPlayer「这份列表不会变」且「没有更多分片了」——电视播完这 4 段
+    就停，或由客户端拿同一份列表重头循环，真机症状「片子只能放 20 秒」。
+
+    只剥 ENDLIST 不够：RFC 8216 里 VOD 的语义就是「播放列表不会改变」，
+    播放器有权据此停止轮询。必须一并把 VOD 翻成 EVENT，AVPlayer 才会按
+    TARGETDURATION 持续轮询同一 URL；全片段并进来后的下一次轮询就拿到长
+    列表，从当前进度无缝接着放，用户不必重看片头。
+
+    全片包仍写 ENDLIST（pack_source 的 vod 口径不变），轮询到它即宣告完整。
+    本函数幂等：已经开过环的列表再调一次原样返回 False。
+    """
+    playlist = out_dir / name
+    try:
+        text = playlist.read_text(encoding="utf-8")
+    except OSError:
+        return False
+    if "#EXT-X-ENDLIST" not in text and "PLAYLIST-TYPE:VOD" not in text:
+        return False
+    entries = _playlist_entries(text)
+    if not entries:
+        return False
+    try:
+        _write_growing_playlist(out_dir, entries, name)
+    except OSError:
+        return False
+    return True
+
+
+def _read_marker(out_dir: Path) -> dict:
+    """读 source.json；不存在或读坏了一律回空 dict（调用方按「不是全片」处理）。"""
+    marker = out_dir / "source.json"
+    if not marker.exists():
+        return {}
+    try:
+        meta = json.loads(marker.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return meta if isinstance(meta, dict) else {}
+
+
+def _open_stub_if_needed(out_dir: Path) -> bool:
+    """磁盘上躺着的是秒开 stub（marker seconds 非 0）就把它开环。
+
+     fresh 打包路径之外的所有入口都靠它兜底：重开同一部片、上一会话留下的
+     stub、_maybe_renew_pack 换装前的那份。不开环的话 AVPlayer 拿到的还是
+     VOD+ENDLIST，照样停在 20 秒处——真机症状复现，而服务端日志一片安静。
+    自称全片（seconds==0）或毒包都不碰：前者已经带 ENDLIST 是正确终态，
+     后者要走 _maybe_renew_pack 的自愈重打。
+    """
+    if not _is_stub_pack(out_dir):
+        return False
+    return _open_stub_playlist(out_dir)
+
+
+def _is_stub_pack(out_dir: Path) -> bool:
+    """盘上这份是不是「秒开 stub」：marker 在、seconds 非 0、不是毒包。
+
+    自称全片（seconds==0）不算：它带 ENDLIST 是正确终态，轮询到即宣告完整，
+    开环反而会让 AVPlayer 永无止境地轮询一份已经放完的列表。毒包也不算：
+    要走 _maybe_renew_pack 的自愈重打，开环只会让坏包播得更久。
+    """
+    meta = _read_marker(out_dir)
+    if not meta or meta.get("seconds") in (0, 0.0, None):
+        return False
+    return not _pack_poisoned(meta, out_dir)
+
+
+def _align_stub_to_full_pack(out_dir: Path, name: str = "video.m3u8") -> int:
+    """把秒开 stub 整理成「全片包的严格前缀 + 开环 EVENT」，返回保留段数。
+
+    为什么（2026-11-07）：真机症状「片子只能放 20 秒」由两半拼成——
+    AVPlayer 播完 stub 那 4 段就停（列表带 ENDLIST 的 VOD 口径），以及全片
+    打包那几分钟里没有任何新内容可放（开环了也没段可并）。两半一起治：
+
+    1. _trim_stub_tail：stub 由 `-t INSTANT_PACK_SECONDS` 打出，末段必然被
+       时长截断（20s 源 → 6/6/6/2.173 四段），全片包同索引是完整的一段。
+       两边同一索引段时长不同，后台把全片段并进来时播放器会在接缝处跳走
+       几秒（实测 20.17s 直接跳到 24s）。砍掉截断尾段，stub 就成了全片包的
+       严格前缀，接缝长度为零。
+    2. _open_stub_playlist：VOD+ENDLIST 等于同时声明「列表不会变」和「没有
+       更多分片」，播放器有权据此停止轮询。翻成 EVENT 它才会按 TARGETDURATION
+       持续轮询同一 URL，全片段并进来后的下一次轮询就接着放。
+
+    与 remux.trim_stub_tail 不是一回事：那个按 min_seconds 丢「几帧的残尾」
+    （治黑屏），这个无条件丢末段（治并段接缝），且只管 serve 的秒开 stub。
+
+    幂等：已对齐又已开环的列表再调一次，返回原段数、一个字节都不改盘。
+    判据用列表形态而不是计数器：ffmpeg 的 stub 永远是 VOD+ENDLIST，而
+    _write_growing_playlist 的产出永远是 EVENT 且无 ENDLIST——「没开环」
+    就等价于「没对齐过」。align 在 marker 落盘前跑（秒开路径），不能靠
+    marker 记状态。
+    """
+    try:
+        text = (out_dir / name).read_text(encoding="utf-8")
+    except OSError:
+        return 0
+    entries = _playlist_entries(text)
+    if not entries:
+        return 0
+    if "#EXT-X-ENDLIST" not in text and "PLAYLIST-TYPE:VOD" not in text:
+        # 已经开环 = 已经对齐过。再砍一次会把一段完整内容砍掉——秒开路径和
+        # _pack_full_swap 会各调一次本函数，漏了这条就不是幂等。
+        return len(entries)
+    kept = _trim_stub_tail(out_dir, name)
+    if kept:
+        _open_stub_playlist(out_dir, name)
+    return kept
 
 
 def _pack_playable(out_dir: Path, src: str) -> bool:
@@ -630,6 +1042,19 @@ def parse_range(value: str | None, length: int) -> tuple[str, ByteRange | None]:
     return PARTIAL, ByteRange(start, min(end, length - 1))
 
 
+def _open_ended_range(value: str | None) -> bool:
+    """Range 是不是 `bytes=X-` 这种不带上界的开区间请求。
+
+    与 `bytes=X-<last>`（有界）分开：有界区间是客户端点名要的确切字节，
+    一个字节都不能少；开区间只是「从 X 起给我剩下的」，本端有权分段给。
+    """
+    if not value:
+        return False
+    _, _, spec = value.partition("=")
+    first, _, last = spec.partition("-")
+    return bool(first.strip()) and not last.strip()
+
+
 class HlsRequestHandler(SimpleHTTPRequestHandler):
     protocol_version = "HTTP/1.1"  # AVPlayer 会复用连接，1.0 会让它反复重建
     # keep-alive 没设读超时：电视切台/退后台/换网卡后那条连接就缸在
@@ -755,6 +1180,26 @@ class HlsRequestHandler(SimpleHTTPRequestHandler):
 
         length = os.stat(filesystem).st_size
         verdict, rng = parse_range(self.headers.get("Range"), length)
+        # 开区间请求分段给：见 MAX_OPEN_RANGE_SEND。有界区间（bytes=X-Y）
+        # 是客户端点名要的确切字节，一律不截。
+        raw_range = self.headers.get("Range")
+        if (rng is not None and MAX_OPEN_RANGE_SEND > 0
+                and _open_ended_range(raw_range)):
+            capped_end = rng.start + MAX_OPEN_RANGE_SEND - 1
+            if capped_end < rng.end:
+                print(f"[serve] 开区间截断 {os.path.basename(filesystem)} "
+                      f"{rng.start}-{rng.end} → {rng.start}-{capped_end}"
+                      f"（每次最多 {MAX_OPEN_RANGE_SEND // 1024}KiB）",
+                      flush=True)
+                rng = ByteRange(rng.start, capped_end)
+        # 诊断：ATV 反复只要同一个分片时，必须看见它到底在要哪些字节、
+        # 以及本端回了什么，否则「卡住」只能靠猜（2026-11-08 真机现场：
+        # video12.m4s 被 206 循环打了 6 分钟，Range 头是关键缺失信息）。
+        if rng is not None:
+            print(f"[serve] range {os.path.basename(filesystem)} "
+                  f"{rng.start}-{rng.end}/{length} "
+                  f"({rng.length}B, ua={self.headers.get('User-Agent', '?')[:40]})",
+                  flush=True)
         if verdict == UNSATISFIABLE:
             self.send_response(416)
             self.send_header("Content-Range", f"bytes */{length}")
@@ -776,7 +1221,15 @@ class HlsRequestHandler(SimpleHTTPRequestHandler):
             return
         with open(filesystem, "rb") as handle:
             handle.seek(start)
+            # 诊断：区分「服务端被 TCP 窗口堵住」（网络瓶颈）与「客户端读一点
+            # 就关」（客户端主动少读）。前者 sent 耗时长，后者耗时可短可长但
+            # 紧跟 ConnectionReset/BrokenPipe。
+            _t0 = time.monotonic()
             self._pipe(handle, size)
+            print(f"[serve] sent {os.path.basename(filesystem)} "
+                  f"{size}B in {time.monotonic() - _t0:.2f}s "
+                  f"({size * 8 / max(1e-9, time.monotonic() - _t0) / 1e6:.1f} Mbps)",
+                  flush=True)
 
     def _pipe(self, handle, remaining: int, chunk: int = 256 * 1024) -> None:
         stream_file(handle, self.wfile, remaining, chunk=chunk)
@@ -835,6 +1288,11 @@ class HlsRequestHandler(SimpleHTTPRequestHandler):
         # 行都不打，真机症状「无法播放」（2026-10-03 纽伦堡现场：秒开包早已
         # 在盘，点击后 /jf/pack 零日志）。
         if _pack_playable(out_dir, src) or _cache_fresh(out_dir, src, seconds):
+            # 磁盘上躺着的是上一会话的秒开 stub（marker seconds 非 0），列表还是
+            # VOD+ENDLIST。不开环的话 AVPlayer 播完那 20 秒就停——真机症状
+            # 「片子只能放 20 秒」，而这条路根本不打包、serve 日志一片安静。
+            # 全片包（seconds==0）和毒包都不碰，见 _open_stub_if_needed。
+            _open_stub_if_needed(out_dir)
             self._send_pack_redirect(item_id)
             return
         # Declared outside the lock so the post-lock spawn can always see it
@@ -898,6 +1356,14 @@ class HlsRequestHandler(SimpleHTTPRequestHandler):
                             master_uri=f"/_jf/{item_id}/video.m3u8",
                             subtitle_texts=texts,
                         )
+                        # 秒开包对齐 + 开环：电视播完秒开段后持续轮询同一
+                        # URL，后台并进来的全片段让它接着放，不再「只能放
+                        # 20 秒」。截断尾段必须一起砍，理由见
+                        # _align_stub_to_full_pack。
+                        _kept = _align_stub_to_full_pack(out_dir)
+                        if _kept:
+                            print(f"[serve] 秒开包已开环 {item_id}"
+                                  f"（{_kept} 段，可并段续播）", flush=True)
                         _need_full_upgrade = True
                     elif seconds == 0:
                         # 全片直接并行打：实测 34 分钟/5GB 的源单进程要
