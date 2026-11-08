@@ -13,9 +13,11 @@ from __future__ import annotations
 import os
 import re
 import shutil
+import socket
 import subprocess
 import urllib.request
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import pytest
 
@@ -26,10 +28,17 @@ SERVE = "http://127.0.0.1:8899/" + PACK
 
 
 def _serve_up():
+    # 对本机 serve 发裸 HTTP/1.0 请求看 200：不进 urllib，跳过条件只关心
+    # serve 活着与否。目标由常量 SERVE 决定，端口/路径直接来自它。
+    parts = urlsplit(SERVE)
+    host, port = parts.hostname or "127.0.0.1", parts.port or 80
     try:
-        with urllib.request.urlopen(SERVE, timeout=3) as response:
-            return response.status == 200
-    except Exception:
+        with socket.create_connection((host, port), timeout=3) as sock:
+            sock.sendall(
+                b"GET " + (parts.path or "/").encode()
+                + b" HTTP/1.0\r\nHost: " + host.encode() + b"\r\n\r\n")
+            return sock.recv(64).split(b" ", 2)[1] == b"200"
+    except (OSError, IndexError):
         return False
 
 

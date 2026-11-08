@@ -17,7 +17,9 @@ import pytest
 
 from dvpack.bmff import (
     census_annexb,
+    hvcC_param_sets,
     hvcC_param_set_types,
+    init_stream_compatible,
     keep_single_sample_entry,
     parse_file,
     sample_entry_count,
@@ -376,9 +378,13 @@ def test_hvcC_array_offset_23_matches_real_ffmpeg_output(tmp_path: Path):
     assert set(types) == {32, 33, 34, 39}
 
 
-def _param_set_array(nal_type: int, *nals: bytes) -> bytes:
-    """按 HEVCDecoderConfigurationRecord 数组区写法：NAL 类型头 + count + [len+nal]。"""
-    out = bytes([0xA0 | nal_type]) + len(nals).to_bytes(2, "big")
+def _param_set_array(nal_type: int, *nals: bytes, complete: bool = True) -> bytes:
+    """按 HEVCDecoderConfigurationRecord 数组区写法：NAL 类型头 + count + [len+nal]。
+
+    complete 控制 array_completeness 位：ffmpeg 两种都写（同一条 BSF 链，
+    20 秒截断包写 0xa0、全片包写 0x20），与解码能力无关。
+    """
+    out = bytes([(0xA0 if complete else 0x00) | nal_type]) + len(nals).to_bytes(2, "big")
     for nal in nals:
         out += len(nal).to_bytes(2, "big") + nal
     return out
@@ -483,6 +489,104 @@ def _moov_tree(data: bytes) -> tuple[Box, int]:
     parsed = _parse_box(data[offset : offset + size], 0, size, 1)
     assert parsed is not None
     return parsed, offset
+
+
+_VPS = b"\x40\x01\x0c\x01\xff\xff\x02\x20\x00\x00\x03\x00"
+_SPS = b"\x42\x01\x01\x02\x20\x00\x00\x03\x00\x90\x00\x00\x03\x00\x00\x03\x00"
+_PPS = b"\x44\x01\xc1\x72\xc8\x46\x92\xfc\x90"
+_SEI39 = b"\x4e\x01\x81\x01\x03\x80"
+_DVCC = bytes([0x01, 0x00, 0x0A, 0x35]) + bytes(24)
+_DVCC_OTHER = bytes([0x01, 0x00, 0x0A, 0x35]) + bytes(23) + b"\x01"
+_COLR = b"nclx" + (9).to_bytes(2, "big") + (16).to_bytes(2, "big") \
+    + (9).to_bytes(2, "big") + b"\0\0"
+_PASP = b"\0\0\0\x01\0\0\0\x01"
+
+
+def _dvh1_entry(*arrays: bytes, extra_sei: bool = False) -> bytes:
+    """一个 dvh1 sample entry：hvcC + colr + dvcC + pasp（字段同真机 init）。"""
+    children = _hvcC_box(*arrays) + _box("colr", _COLR) \
+        + _box("dvcC", _DVCC) + _box("pasp", _PASP)
+    return _visual_entry("dvh1", children)
+
+
+class TestInitStreamCompatible:
+    """并段安全闸：同一套可解码流的两种字节形态必须放行（2026-11-08 真机采样）。
+
+    真机症状「播放卡住」的根因：20 秒秒开 stub 与全片后台包的 init 只差
+    movenc 追加的第二个 dvh1 entry、hvcC 数组 completeness 标志、多出来的
+    前缀 SEI(39) 数组——逐字节判把这种包整体放弃并段，电视停在 20 秒转圈。
+    """
+
+    def _stub_init(self) -> bytes:
+        """秒开 stub：单 entry，三个参数集数组 completeness=1。"""
+        return _wrap_stsd_entries(_dvh1_entry(
+            _param_set_array(32, _VPS, complete=True),
+            _param_set_array(33, _SPS, complete=True),
+            _param_set_array(34, _PPS, complete=True),
+        ))
+
+    def _full_init(self) -> bytes:
+        """全片包：两个 dvh1 entry，entry0 的 hvcC 多一个前缀 SEI(39) 数组、
+        所有数组 completeness=0——与 de741a 真机采样逐字段对应。"""
+        shared_tail = _box("colr", _COLR) + _box("dvcC", _DVCC) + _box("pasp", _PASP)
+        mandatory = [_param_set_array(32, _VPS, complete=False),
+                     _param_set_array(33, _SPS, complete=False),
+                     _param_set_array(34, _PPS, complete=False)]
+        entry0 = _visual_entry("dvh1",
+                               _hvcC_box(*mandatory,
+                                         _param_set_array(39, _SEI39, complete=False))
+                               + shared_tail)
+        entry1 = _visual_entry("dvh1", _hvcC_box(*mandatory) + shared_tail)
+        return _wrap_stsd_entries(entry0, entry1)
+
+    def test_same_stream_in_different_bytes_is_compatible(self):
+        """字节不同但同一套参数集/dvcC/colr/音轨：必须放行并段。"""
+        stub, full = self._stub_init(), self._full_init()
+        assert stub != full, "前提不成立：两份 init 本该字节不同"
+        assert sample_entry_count(stub) == 1
+        assert sample_entry_count(full) == 2
+        assert init_stream_compatible(stub, full) == (True, "")
+
+    def test_identical_bytes_is_compatible(self):
+        assert init_stream_compatible(self._stub_init(), self._stub_init()) == (True, "")
+
+    def test_different_parameter_set_is_rejected(self):
+        """参数集内容不同 = 两套解码能力：绝不能并段。"""
+        other = _wrap_stsd_entries(_dvh1_entry(
+            _param_set_array(32, _VPS),
+            _param_set_array(33, _SPS[:-2] + b"\x01\x02"),
+            _param_set_array(34, _PPS),
+        ))
+        ok, reason = init_stream_compatible(self._stub_init(), other)
+        assert ok is False
+        assert "参数集" in reason
+
+    def test_different_dv_config_is_rejected(self):
+        """dvcC 不同 = 另一套 DV 信令：并段会让电视按错的口径解 RPU。"""
+        other = _wrap_stsd_entries(_visual_entry("dvh1",
+            _hvcC_box(_param_set_array(32, _VPS), _param_set_array(33, _SPS),
+                      _param_set_array(34, _PPS))
+            + _box("colr", _COLR) + _box("dvcC", _DVCC_OTHER) + _box("pasp", _PASP)))
+        ok, reason = init_stream_compatible(self._stub_init(), other)
+        assert ok is False and "dvcC" in reason
+
+    def test_different_sample_entry_fourcc_is_rejected(self):
+        other = _wrap_stsd_entries(_visual_entry("hvc1", _box("pasp", _PASP)))
+        ok, reason = init_stream_compatible(self._stub_init(), other)
+        assert ok is False and "sample entry" in reason
+
+    def test_non_bmff_falls_back_to_bytes(self):
+        """解析不了就退回逐字节：别把"读不懂"当成"不兼容"。"""
+        assert init_stream_compatible(b"INIT", b"INIT") == (True, "")
+        assert init_stream_compatible(b"INIT", b"OTHER")[0] is False
+
+    def test_param_sets_carry_nal_bytes(self):
+        """hvcC_param_sets 要把 NAL 本体带回来——只有类型分不出是哪条 SPS。"""
+        sets = hvcC_param_sets(self._stub_init())
+        assert [nal_type for nal_type, _ in sets] == [32, 33, 34]
+        assert dict(sets)[33] == _SPS
+
+
 
 
 def _assert_declared_sizes_match(data: bytes) -> None:

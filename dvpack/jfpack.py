@@ -163,8 +163,7 @@ def _decode_subtitle(payload: bytes, codec: str) -> str:
         handle, temp_path = tempfile.mkstemp(suffix=f".{name}")
         os.close(handle)
         try:
-            with open(temp_path, "wb") as fh:
-                fh.write(payload)
+            Path(temp_path).write_bytes(payload)
             proc = _run(
                 [
                     str(require(FFMPEG)),
@@ -257,6 +256,10 @@ def pack_source(
     # 输入只产出 1 个 100MB+ 分片（真机：Apple TV 拉完 video.m3u8 后既不
     # 请求 init.mp4 也不拉分片，直接黑屏）。2026-09-27 逐项 A/B 实测确认。
     normalize_timestamps: bool = True,
+    #: 透传给 hls_command：VOD（默认）= 退出才落带 ENDLIST 的最终列表；
+    #: EVENT = 边编码边写列表。serve 的全片后台打包要 EVENT，好让并段线程
+    #: 增量读到已封段（见 remux.hls_command 的 playlist_type）。
+    playlist_type: str = "vod",
 ) -> PackResult:
     """URL → HLS。闸门不过就不动 ffmpeg；产出不完整就报错，不留半个包。
 
@@ -303,6 +306,7 @@ def pack_source(
             maps=maps,
             setts=setts_bsf(source) if normalize_timestamps else None,
             transcode_audio=transcode_audio,
+        playlist_type=playlist_type,
         ),
         cwd=out_dir,
         timeout=ffmpeg_timeout(seconds),

@@ -151,6 +151,66 @@ def _normalize_timing_line(line: str) -> str:
     if _ARROW in line:
         return line.replace(",", ".")
     return line
+def _fmt_ts(seconds: float) -> str:
+    """秒 -> 00:00:00.000 WebVTT 时间戳。"""
+    h = int(seconds // 3600)
+    m = int((seconds % 3600) // 60)
+    s = seconds % 60
+    return f"{h:02d}:{m:02d}:{s:06.3f}"
+
+
+def _parse_vtt_cues(data: bytes) -> list[tuple[float, float, str]]:
+    """把 WebVTT 字节解析成 (start, end, text) 列表。"""
+    text = data.decode("utf-8", "replace")
+    lines = text.split("\n")
+    cues: list[tuple[float, float, str]] = []
+    i = 0
+    while i < len(lines):
+        line = lines[i].strip()
+        if _ARROW in line:
+            left, _, right = line.partition(_ARROW)
+            start, stop = _stamp(left), _stamp(right)
+            if start is not None and stop is not None and stop > start:
+                j = i + 1
+                body_lines: list[str] = []
+                while j < len(lines) and lines[j].strip():
+                    body_lines.append(lines[j])
+                    j += 1
+                cues.append((start, stop, "\n".join(body_lines)))
+            i = j
+        else:
+            i += 1
+    return cues
+
+
+def _dedupe_en_cues(data: bytes) -> bytes:
+    """英文字幕同一时间只保留一条 cue，避免双语字幕时英文重复多行。
+
+    规则：按开始时间排序，若当前 cue 与上一条保留的 cue 时间重叠
+    且正文相同，则合并时段；若时间重叠且正文不同，保留较长者。
+    输出 WebVTT 字节，英文贴屏幕最底（position:100% line:100% align:end）。
+    """
+    cues = _parse_vtt_cues(data)
+    if not cues:
+        return data
+    cues.sort(key=lambda c: c[0])
+    kept: list[tuple[float, float, str]] = []
+    for start, stop, text in cues:
+        if kept and start - kept[-1][1] < 0.5 and text.strip() == kept[-1][2].strip():
+            kept[-1] = (kept[-1][0], max(kept[-1][1], stop), kept[-1][2])
+        elif kept and start < kept[-1][1]:
+            if len(text) >= len(kept[-1][2]):
+                kept[-1] = (start, stop, text)
+        else:
+            kept.append((start, stop, text))
+    out = ["WEBVTT", ""]
+    for start, stop, text in kept:
+        out.append(f"{_fmt_ts(start)} --> {_fmt_ts(stop)}")
+        out.append(text)
+        out.append("")
+    return ("\n".join(out).rstrip("\n") + "\n").encode("utf-8")
+
+
 
 
 def to_vtt(text: str) -> bytes:
@@ -196,7 +256,9 @@ def subtitle_playlist_text(
     spans = [span for span in chunks if span[1] > span[0]]
     first_cue = None
     for index, (start, stop) in enumerate(spans):
-        if arrow in data[start:stop]:
+        # 跳过 0 时长 cue：头段合并跨度直到首条可用 cue，中间坏 cue 的文本
+        # 仍被合并段带出去，避免「0 时长段被滤掉 → WEBVTT 头跟着丢」。
+        if arrow in data[start:stop] and _cue_seconds(data[start:stop]) > 0:
             first_cue = index
             break
     if first_cue is None:
@@ -236,6 +298,9 @@ def write_subtitle_tracks(out_dir: str | Path, texts: Mapping[str, str]) -> list
         if not text or not text.strip():
             continue
         payload = to_vtt(text)
+        # 英文去重一行、贴最底；中文保持原样
+        if language == "en":
+            payload = _dedupe_en_cues(payload)
         vtt = base / f"sub_{language}.vtt"
         vtt.write_bytes(payload)
         track = SubtitleTrack(language=language, name=name, vtt=vtt, default=default)
