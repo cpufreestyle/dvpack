@@ -1642,6 +1642,11 @@ class HlsRequestHandler(SimpleHTTPRequestHandler):
                          name=f"dvpack-subonline-{item_id}").start()
 
 
+def _has_chinese(text: str) -> bool:
+    """片名含中文（CJK 统一表意文字）即判定为中文视频。"""
+    return any("\u4e00" <= ch <= "\u9fff" or "\u3400" <= ch <= "\u4dbf" for ch in text)
+
+
 def _subtitle_texts(src: str, *, root: str | Path | None = None,
                     info=None) -> SubtitleResolution:
     """本地级字幕解析：L1 Jellyfin 文本轨 → L2 _subs/ 缓存。
@@ -1700,6 +1705,10 @@ def _online_subs_body(directory, src: str, item_id: str, out_dir: Path,
     麻烦 /Items。serve 后台线程没有现成名，留空走反查。
     """
     from . import subs, subsource
+
+    # 中文视频不需要字幕：片名含 CJK 时整体跳过在线腿
+    if name and _has_chinese(name):
+        return "中文视频，跳过字幕"
 
     if not subsource.online_enabled():
         return "在线腿已关（%s=0）" % subsource.ONLINE_ENV

@@ -429,9 +429,9 @@ def test_online_subs_body_uses_passed_name_without_lookup(tmp_path: Path, monkey
 
     monkeypatch.setattr(subsource, "fetch_online_texts", _fetch)
     receipt = serve_module._online_subs_body(tmp_path, _SRC, "5360", out_dir,
-                                             "真片名")
+                                             "The Beast in Me")
     assert "zh+en" in receipt
-    assert seen["name"] == "真片名"
+    assert seen["name"] == "The Beast in Me"
 
 
 def test_online_subs_body_skips_while_negative_cache_blocks(tmp_path: Path, monkeypatch):
