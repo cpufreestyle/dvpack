@@ -223,7 +223,7 @@ dvpack 的 subsource 已有在线/本地分级，但可以更明确地划出
 | 3 | relay 加 range-aware 预取窗口，替代整 body 缓冲 | relay.py + serve.py | Infuse `ReadAheadLoader` + `InputStreamCacheRangeAccess` | 中，要重测 TCC/seek | **已落地（Range 缓存）**：relay 内置 per-URL 32MB LRU 区间缓存，重复 Range 不再打 Jellyfin；截断响应绝不进缓存 |
 | 4 | `/jf/pack` 多轨共享同一下载流 | prewarm.py / serve._online_subs_body | Infuse `SequentialSharingInputStream` | 中 | **进程内已落地**：probe/pack/poster/字幕的重复 Range 共享同一份缓存 |
 | 5 | 速率统计 → 自适应预取窗口/并发 | serve.py 统计 | Infuse `FCInputStreamSpeedMeter` / `InputStreamStats` | 中 | **已落地**：`dvpack/speed.py`（`SpeedMeter`/`SpeedRegistry`）；`serve._respond` 按客户端实测速率缩放开区间响应，新增 `/__speed` 诊断端点 |
-| 6 | DV 动态元数据（RPU）单独建模，为 dovi_tool `-m 5` 铺路 | 新增 `dvmeta.py` | Infuse `FCDolbyStreamParser` / `AVDOVIMetadata` / `GENERATE_DOVI_RESHAPE` | 高，待真机 |
+| 6 | DV 动态元数据（RPU）单独建模，为 dovi_tool `-m 5` 铺路 | 新增 `dvmeta.py` | Infuse `FCDolbyStreamParser` / `AVDOVIMetadata` / `GENERATE_DOVI_RESHAPE` | 高，待真机 | **已落地**：`dvpack/dvmeta.py`（`RpuFrame`/`RpuScan`/`scan_fmp4`/`extract_rpu`/`inject_rpu_m5`/`reshape_rpu_roundtrip`）；CLI 子命令 `dvpack dvmeta scan <fmp4>` / `dvpack dvmeta reshape <fmp4>` |
 
 第 1、2 条是纯静态、可离线验证的重构，建议先做；3、4 需要重跑 HANDOFF 里的
 真机矩阵；6 依赖 single_fmp4 是否亮 DV 的结论。
@@ -380,7 +380,7 @@ dvplay 的分类现在是服务端固定顺序；把排序抽成策略，用户�
 4. 排序策略化（片子分类可切换）；
 5. 删除 Handler/Operation 分层（ATV 删除联动本地）。
 
-仍未做（承接上一轮遗留）：#5 速率统计→自适应预取、#6 RPU 动态元数据建模。
+仍未做（承接上一轮遗留）：#5 速率统计→自适应预取（已落地 2026-11-15）、#6 RPU 动态元数据建模（已落地 2026-11-21）。
 
 ## 12. 落地核对（2026-10-30 第二轮，逐条比对 dvplay 现状）
 
@@ -413,7 +413,7 @@ dvplay 的分类现在是服务端固定顺序；把排序抽成策略，用户�
   swift 脚本逐码验证（-1009/-1001/-1003/-1004/-1006→unreachable，
   -1013→unauthorized，401/403→unauthorized，5xx→server，-999→cancelled）。
 
-**仍未做**：#5 速率统计→自适应预取、#6 RPU 动态元数据建模、
+**仍未做**：~~#5 速率统计→自适应预取（已落地）~~、~~#6 RPU 动态元数据建模（已落地）~~、
 按 share 的索引状态机、DirectoryWatcher 增量刷新。
 
 **核对后确认 dvplay 已实现、不再作为建议（2026-10-30）**：
@@ -479,4 +479,4 @@ Infuse 的 `FCInputStreamSpeedMeter` 在这里的对应物是 `dvpack/speed.py`�
 开关：`DVPACK_ADAPTIVE_RANGE=0` 关闭；`DVPACK_RANGE_TARGET_SECONDS` 调目标时长；
 `DVPACK_MAX_OPEN_RANGE_SEND` 仍是静态上限（0 = 完全不截）。
 
-**未做**：#6 RPU 动态元数据建模（需要真机确认 single_fmp4 的 DV 表现后再动）。
+**#6 落地（2026-11-21）**：`dvpack/dvmeta.py` — `RpuScan`/`scan_fmp4`/`extract_rpu`/`inject_rpu_m5`/`reshape_rpu_roundtrip`；CLI `dvpack dvmeta scan` / `dvpack dvmeta reshape`。真机验证路径：先 `dvpack dvmeta scan <分片.m4s>` 确认 RPU 覆盖率，不足 100% 时走 `reshape` 重建。

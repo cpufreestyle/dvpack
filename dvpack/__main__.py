@@ -29,8 +29,9 @@ from .flow import FlowError
 from .serve import lan_address, serve as serve_files
 from . import prewarm
 from . import configcmd
-from . import flow
 from . import subwarm
+from .dvmeta import DvMetaError, extract_rpu, inject_rpu_m5, scan_fmp4, reshape_rpu_roundtrip
+from . import flow
 
 
 def _check(path: Path) -> int:
@@ -179,6 +180,14 @@ def main(argv: list[str] | None = None) -> int:
                         help="Jellyfin 全库字幕批量预热：中英双语提前抓进 L2 _subs 缓存")
     subwarm.add_arguments(sw)
 
+    dm = sub.add_parser("dvmeta", help="DV 动态元数据（RPU）诊断与 reshape")
+    dm_sub = dm.add_subparsers(dest="dm_cmd", required=True)
+    dm_scan = dm_sub.add_parser("scan", help="RPU 存在性普查（纯 Python，不调外部进程）")
+    dm_scan.add_argument("path", type=Path, help="fmp4/MP4 文件")
+    dm_reshape = dm_sub.add_parser("reshape", help="extract-rpu → inject-m5 → 核对")
+    dm_reshape.add_argument("path", type=Path, help="fmp4/MP4 文件")
+    dm_reshape.add_argument("-o", "--out", type=Path, default=None, help="输出路径（默认 <stem>.m5<ext>）")
+
     args = parser.parse_args(argv)
     try:
         if args.cmd == "check":
@@ -195,6 +204,11 @@ def main(argv: list[str] | None = None) -> int:
             return flow.run_from_args(args)
         if args.cmd == "subwarm":
             return subwarm.run_from_args(args)
+        if args.cmd == "dvmeta":
+            if args.dm_cmd == "scan":
+                return _dvmeta_scan(args.path)
+            if args.dm_cmd == "reshape":
+                return _dvmeta_reshape(args.path, args.out)
         return _serve(args.root, args.port, args.host)
     except (RemuxError, FlowError, UnknownTransfer, FileNotFoundError) as exc:
         print(f"失败：{exc}", file=sys.stderr)
@@ -203,3 +217,41 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+def _dvmeta_scan(path: Path) -> int:
+    """scan 子命令：用纯 Python 对 fmp4/MP4 做 RPU 存在性普查。"""
+    scan = scan_fmp4(path)
+    print(f"文件 : {path}")
+    print(f"NALU 长度前缀 : {scan.nalu_length_size} 字节")
+    print(scan.summary())
+    if not scan.rpu_present:
+        print("结论 : 无 RPU —— DV 徽标无法点亮，考虑走 dvmeta reshape 路径")
+        return 1
+    if scan.missing_frames:
+        print(f"结论 : RPU 不完整（{len(scan.missing_frames)} 帧缺失），建议走 reshape")
+        return 1
+    print("结论 : RPU 完整，每帧覆盖")
+    return 0
+
+
+def _dvmeta_reshape(path: Path, out: Path | None) -> int:
+    """reshape 子命令：extract-rpu → inject-m5 → 核对。"""
+    try:
+        m5_path, before, after = reshape_rpu_roundtrip(
+            path, keep_intermediates=False
+        )
+    except DvMetaError as exc:
+        print(f"失败：{exc}", file=sys.stderr)
+        return 2
+    if out and out != m5_path:
+        m5_path.rename(out)
+        m5_path = out
+    print(f"产物   : {m5_path}")
+    print(f"注入前 : {before.summary()}")
+    print(f"注入后 : {after.summary()}")
+    if after.missing_frames:
+        print(f"警告：注入后仍有 {len(after.missing_frames)} 帧缺 RPU", file=sys.stderr)
+        return 1
+    print("结论 : reshape 完成，每帧 RPU 覆盖")
+    return 0
+
