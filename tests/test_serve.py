@@ -149,6 +149,17 @@ def test_playlist_mime_and_no_store(site):
     assert body == b"#EXTM3U\nvideo.m3u8\n"
 
 
+def test_speed_endpoint_reports_adaptive_state(site):
+    """运维端点：电视播放时 `curl <host>:8899/__speed` 能直接看到实测 Mbps。"""
+    resp, body = _get(site, "/__speed")
+    assert resp.status == 200
+    assert resp.getheader("Content-Type") == "application/json; charset=utf-8"
+    payload = json.loads(body)
+    assert payload["adaptive"] is True
+    assert payload["target_seconds"] > 0
+    assert isinstance(payload["clients"], list)
+
+
 def test_segment_range_returns_206_with_exact_slice(site):
     resp, body = _get(site, "/s0.m4s", {"Range": "bytes=100-199"})
     assert resp.status == 206

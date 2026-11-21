@@ -1,3 +1,53 @@
+# HANDOFF v31 (2026-11-15 13:45) — Infuse #5 落地（自适应窗口）；8899 被占导致 serve 整天没起来
+
+## 一句话结论
+**Infuse 笔记里「仍未做」的 #5（速率统计 → 自适应窗口）已落地并真机自测通过。**
+顺手救回一个更严重的问题：**端口 8899 从今天 01:17 起被别的进程占着，dvpack serve
+一直在 crash-loop，等于整天没服务。**
+
+## 1. 端口事故（先看这条）
+- 现场：`lsof -iTCP:8899 -sTCP:LISTEN` → PID 87955，命令是
+  `python3 -m http.server 8899 --bind 0.0.0.0`，cwd 在
+  `~/Library/Application Support/com.tencent.mac.marvis/.../workspace/conv_.../output`
+  —— 一个腾讯 Marvis 会话留下的静态文件服务，**与 dvpack 无关**。
+- 后果：`launchctl print gui/501/com.dvpack.serve` 显示 `state = spawn scheduled`、
+  `active count = 0`；`/tmp/dvpack-serve.log` 里
+  `OSError: [Errno 48] Address already in use` 累计 **5588 次**。
+- 处理：`kill 87955` → launchd KeepAlive 立刻拉起真 serve（新 PID 10783）。
+  `curl -s http://127.0.0.1:8899/__speed` 返回 200 即活。
+- **教训**：电视「无法播放/卡住」时先跑
+  `lsof -nP -iTCP:8899 -sTCP:LISTEN`，确认监听者是不是 dvpack。8899 是硬约定，
+  任何别的进程占着都会让服务静默死掉（launchd 只会无限重试）。
+
+## 2. #5 落地：`dvpack/speed.py` + `serve._respond`
+- **口径**：客户端 `bytes=A-` 之后又来 `bytes=(A+N)-`，间隔 Δt → 速率 N/Δt。
+  这是「这一段被真实消费掉的周期」，不是 socket write 耗时。
+- **踩坑实证**：4 Mbps 模拟链路上，2 MiB 响应的 write 只阻塞 1.15s（内核发送缓冲
+  吃掉了大半），若用写入耗时算会得到 13.6 Mbps，高 3 倍。所以写入耗时不参与估计。
+- **窗口**：`clamp(实测速率 × 1.5s, 256KiB, MAX_OPEN_RANGE_SEND)`；无样本时用静态上限。
+- **自测（127.0.0.1，限速 64KiB/0.12s）**：
+  - 请求 1：尚无样本 → 2048 KiB；
+  - 请求 2：判定 4.3 Mbps → **779 KiB**；
+  - `/__speed` → `{"mbps": 4.26, "samples": 1, "client": "127.0.0.1"}`。
+- **新增端点** `/__speed`：JSON，含 adaptive / target_seconds / max_bytes / 每客户端 mbps。
+  电视在放的时候直接 `curl http://192.168.1.115:8899/__speed` 就能看到那条链路实测带宽。
+- **开关**：`DVPACK_ADAPTIVE_RANGE=0` 关闭；`DVPACK_RANGE_TARGET_SECONDS` 改目标时长；
+  `DVPACK_MAX_OPEN_RANGE_SEND=0` 恢复到「照单全收」。
+- **日志**：`sent <name> <实发>/<应有>B ... (X Mbps, 有效 Y%)`——
+  现在能直接看出每次响应有多少是空转被丢掉的（`有效 %`）。
+
+## 3. 验证
+- `.venv/bin/python -m pytest tests/ -q` → **837 passed / 21 skipped / 0 failed**
+  （新增 `tests/test_speed.py` 14 条 + `test_serve.py::test_speed_endpoint_reports_adaptive_state`）。
+- serve 已用新代码重启（`launchctl kickstart -k gui/$(id -u)/com.dvpack.serve`）。
+- **DV 徽标不受影响**：改动只在开区间响应的字节数，master/CODECS/VIDEO-RANGE
+  信令链路一行未动。
+
+## 4. 仍未做
+- #6 RPU 动态元数据建模（`dvmeta.py` / `dovi_tool -m 5` 铺路）——等 single_fmp4 的
+  真机 DV 结论。
+- windows 侧 `scripts/deploy.ps1` 仍未经真机验证（等 .68 上跑）。
+
 # HANDOFF v30 (2026-11-08 22:00) — 「还是卡着」定案为 Mac 2.4GHz WiFi 带宽；字幕两项优化已落；迁移 .68 待到位
 
 ## 一句话结论

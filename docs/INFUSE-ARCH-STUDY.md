@@ -222,7 +222,7 @@ dvpack 的 subsource 已有在线/本地分级，但可以更明确地划出
 | 2 | ffmpeg 前加「盒链 + PTS 静态预检」，坏源提前拒 | remux.py 入口 | Infuse `FCFFMPEGDemuxingStream+StreamCorrectionAndValidation` / `FCPTSIncorrectnessDetector` | 低 | **已落地**：remux.validate_segments()；tfdt 片间单调 + duration>0，真实产物与 Apple 参考分片通过，篡改 tfdt 被拒 |
 | 3 | relay 加 range-aware 预取窗口，替代整 body 缓冲 | relay.py + serve.py | Infuse `ReadAheadLoader` + `InputStreamCacheRangeAccess` | 中，要重测 TCC/seek | **已落地（Range 缓存）**：relay 内置 per-URL 32MB LRU 区间缓存，重复 Range 不再打 Jellyfin；截断响应绝不进缓存 |
 | 4 | `/jf/pack` 多轨共享同一下载流 | prewarm.py / serve._online_subs_body | Infuse `SequentialSharingInputStream` | 中 | **进程内已落地**：probe/pack/poster/字幕的重复 Range 共享同一份缓存 |
-| 5 | 速率统计 → 自适应预取窗口/并发 | serve.py 统计 | Infuse `FCInputStreamSpeedMeter` / `InputStreamStats` | 中 |
+| 5 | 速率统计 → 自适应预取窗口/并发 | serve.py 统计 | Infuse `FCInputStreamSpeedMeter` / `InputStreamStats` | 中 | **已落地**：`dvpack/speed.py`（`SpeedMeter`/`SpeedRegistry`）；`serve._respond` 按客户端实测速率缩放开区间响应，新增 `/__speed` 诊断端点 |
 | 6 | DV 动态元数据（RPU）单独建模，为 dovi_tool `-m 5` 铺路 | 新增 `dvmeta.py` | Infuse `FCDolbyStreamParser` / `AVDOVIMetadata` / `GENERATE_DOVI_RESHAPE` | 高，待真机 |
 
 第 1、2 条是纯静态、可离线验证的重构，建议先做；3、4 需要重跑 HANDOFF 里的
@@ -447,3 +447,36 @@ dvplay 的分类现在是服务端固定顺序；把排序抽成策略，用户�
 
 **结论**：可学的东西已沉淀为本笔记 11 节，二进制保留作验收基准。若将来 dvplay
 自己能稳定点亮 DV，Infuse 的基准作用消失，届时可再评估删除。
+
+## 13. #5 落地：速率统计 → 自适应窗口（2026-11-15）
+
+Infuse 的 `FCInputStreamSpeedMeter` 在这里的对应物是 `dvpack/speed.py`：
+
+- `SpeedMeter`：EWMA（α=0.35）+ 120 秒过期；`SpeedRegistry` 按客户端 IP 分桶。
+- **主口径 = 连续区间请求的间隔**：客户端 `bytes=A-` 拿走后，下一次 `bytes=(A+N)-`
+  的间隔 Δt，速率 = N/Δt。量到的就是这一段被真实消费掉的周期。
+- **不用写入耗时**：实测 4 Mbps 模拟链路里，2 MiB 响应的 socket write 只阻塞
+  1.15 秒（内核发送缓冲吃掉了大半），算出来 13.6 Mbps，比真实值高 3 倍。
+- `serve._respond` 在开区间分支里把 `MAX_OPEN_RANGE_SEND` 换成
+  `clamp(实测速率 × 1.5s, 256KiB, 静态上限)`；拿不到样本时维持静态上限。
+
+实测（127.0.0.1，脚本按 64KiB/0.12s 限速读取）：
+
+| 请求 | 客户端实际 | 服务端判定 | 单次窗口 |
+|---|---|---|---|
+| 1 | ≈4.3 Mbps | 尚无样本 | 2048 KiB |
+| 2 | ≈4.3 Mbps | 4.3 Mbps | 779 KiB |
+| 3 | — | 沿用估计 | 779 KiB |
+
+同一个分片从「一次发 2 MiB、客户端只要 1/5」变成「按 1.5 秒的量发」，慢链路上
+被内核丢弃的空转字节显著下降。`/__speed` 直接回：
+
+```json
+{"adaptive": true, "target_seconds": 1.5, "max_bytes": 2097152,
+ "clients": [{"mbps": 4.26, "samples": 1, "client": "192.168.1.100"}]}
+```
+
+开关：`DVPACK_ADAPTIVE_RANGE=0` 关闭；`DVPACK_RANGE_TARGET_SECONDS` 调目标时长；
+`DVPACK_MAX_OPEN_RANGE_SEND` 仍是静态上限（0 = 完全不截）。
+
+**未做**：#6 RPU 动态元数据建模（需要真机确认 single_fmp4 的 DV 表现后再动）。

@@ -36,6 +36,7 @@ from .bmff import init_stream_compatible
 from .p5 import ResignError
 from .probe import NotProbeable
 from .remux import FFMPEG, VIDEO_AUDIO_MAPS, VIDEO_ONLY_MAPS, RemuxError
+from .speed import SpeedRegistry
 from .tools import require, robust_rmtree
 from .subsource import SubtitleResolution
 
@@ -55,6 +56,8 @@ FULL, PARTIAL, UNSATISFIABLE = "full", "partial", "unsatisfiable"
 # （Docker）里、容器是 mkv、AVPlayer 不认——由这个端点现打现取。
 JFPACK_PATH = "/jf/pack"
 JFPURGE_PATH = "/jf/purge"
+#: 只读诊断端点：把每个客户端的实测吞吐与当前窗口回给运维/客户端。
+SPEED_PATH = "/__speed"
 # /jf/poster：Jellyfin 侧无 Primary 海报图的条目（现场 5 部）由 serve 从
 # 片源抽一帧兜底，落 _posters/<id>.jpg。电视侧 posterURL 取不到 tag 时
 # 回落这个端点；首请求后台抽帧先回 404，下次进片库页海报即在。
@@ -326,6 +329,20 @@ _GROW_INIT_TIMEOUT = 120.0
 #: 0 = 不截（恢复旧的照单全收）。
 MAX_OPEN_RANGE_SEND = int(os.environ.get(
     "DVPACK_MAX_OPEN_RANGE_SEND", 2 * 1024 * 1024))
+
+#: 自适应窗口：按实测链路速率缩放单次开区间响应的字节数。
+#:
+#: 2MiB 在千兆内网是保守值，在 5 Mbps 的 2.4GHz Wi-Fi 上却是 3.2 秒的空口
+#: 时间。写死的上限对两头都不合适，所以拿「上一段被消费者真实吃掉的速率」
+#: 乘一个目标时长。拿不到样本（刚起服、刚被清过）时回落到静态上限。
+ADAPTIVE_RANGE = os.environ.get(
+    "DVPACK_ADAPTIVE_RANGE", "1").strip().lower() not in ("0", "false", "off", "no")
+#: 一次响应大致覆盖多少秒的内容。太小会把请求切得过碎（每个请求都有
+#: 建连/头开销），太大则退化成空转。1.5 秒在 5 Mbps 上约等于 0.9 MiB。
+RANGE_TARGET_SECONDS = float(os.environ.get(
+    "DVPACK_RANGE_TARGET_SECONDS", "1.5"))
+
+_CLIENT_SPEEDS = SpeedRegistry()
 
 
 def _sealed_prefix(tmp: Path) -> tuple[list[tuple[float, str]], int]:
@@ -1154,10 +1171,15 @@ class HlsRequestHandler(SimpleHTTPRequestHandler):
         if path == JFPURGE_PATH:
             self._jf_purge()
             return
+        if path == SPEED_PATH:
+            self._speed_report()
+            return
         self._maybe_renew_pack()
         self._respond(body=True)
 
     def do_HEAD(self) -> None:
+        if self.client_address:
+            _CLIENT_SPEEDS.forget(self.client_address[0])
         self._respond(body=False)
 
     def _cache_header(self) -> str:
@@ -1180,23 +1202,36 @@ class HlsRequestHandler(SimpleHTTPRequestHandler):
 
         length = os.stat(filesystem).st_size
         verdict, rng = parse_range(self.headers.get("Range"), length)
+        client_key = self.client_address[0] if self.client_address else "?"
+        name = os.path.basename(filesystem)
         # 开区间请求分段给：见 MAX_OPEN_RANGE_SEND。有界区间（bytes=X-Y）
         # 是客户端点名要的确切字节，一律不截。
         raw_range = self.headers.get("Range")
-        if (rng is not None and MAX_OPEN_RANGE_SEND > 0
-                and _open_ended_range(raw_range)):
-            capped_end = rng.start + MAX_OPEN_RANGE_SEND - 1
+        if rng is not None and MAX_OPEN_RANGE_SEND > 0 and _open_ended_range(raw_range):
+            # 上一次响应之后是不是紧接着往前要：是就说明消费者已经吃完了
+            # 那一段，间隔正好是链路的内容吞吐（见 dvpack/speed.py）。
+            measured = _CLIENT_SPEEDS.poll_advance(client_key, name, rng.start)
+            cap = MAX_OPEN_RANGE_SEND
+            if ADAPTIVE_RANGE:
+                cap = _CLIENT_SPEEDS.cap_bytes(
+                    client_key,
+                    target_seconds=RANGE_TARGET_SECONDS,
+                    max_bytes=MAX_OPEN_RANGE_SEND,
+                )
+            capped_end = rng.start + cap - 1
             if capped_end < rng.end:
-                print(f"[serve] 开区间截断 {os.path.basename(filesystem)} "
+                hint = (f"{measured * 8 / 1e6:.1f} Mbps" if measured
+                        else "尚无样本")
+                print(f"[serve] 开区间截断 {name} "
                       f"{rng.start}-{rng.end} → {rng.start}-{capped_end}"
-                      f"（每次最多 {MAX_OPEN_RANGE_SEND // 1024}KiB）",
+                      f"（{cap // 1024}KiB/次，{hint}）",
                       flush=True)
                 rng = ByteRange(rng.start, capped_end)
         # 诊断：ATV 反复只要同一个分片时，必须看见它到底在要哪些字节、
         # 以及本端回了什么，否则「卡住」只能靠猜（2026-11-08 真机现场：
         # video12.m4s 被 206 循环打了 6 分钟，Range 头是关键缺失信息）。
         if rng is not None:
-            print(f"[serve] range {os.path.basename(filesystem)} "
+            print(f"[serve] range {name} "
                   f"{rng.start}-{rng.end}/{length} "
                   f"({rng.length}B, ua={self.headers.get('User-Agent', '?')[:40]})",
                   flush=True)
@@ -1225,14 +1260,33 @@ class HlsRequestHandler(SimpleHTTPRequestHandler):
             # 就关」（客户端主动少读）。前者 sent 耗时长，后者耗时可短可长但
             # 紧跟 ConnectionReset/BrokenPipe。
             _t0 = time.monotonic()
-            self._pipe(handle, size)
-            print(f"[serve] sent {os.path.basename(filesystem)} "
-                  f"{size}B in {time.monotonic() - _t0:.2f}s "
-                  f"({size * 8 / max(1e-9, time.monotonic() - _t0) / 1e6:.1f} Mbps)",
+            sent = self._pipe(handle, size)
+            elapsed = max(1e-9, time.monotonic() - _t0)
+            # now=_t0：配对要从「开始写」算起，写入耗时里含内核缓冲，
+            # 单看它会把慢链路算快一倍以上（见 dvpack/speed.py）。
+            _CLIENT_SPEEDS.note_response(client_key, name, start, sent, now=_t0)
+            print(f"[serve] sent {name} "
+                  f"{sent}/{size}B in {elapsed:.2f}s "
+                  f"({sent * 8 / elapsed / 1e6:.1f} Mbps, "
+                  f"有效 {sent * 100 // max(1, size)}%)",
                   flush=True)
 
-    def _pipe(self, handle, remaining: int, chunk: int = 256 * 1024) -> None:
-        stream_file(handle, self.wfile, remaining, chunk=chunk)
+    def _pipe(self, handle, remaining: int, chunk: int = 256 * 1024) -> int:
+        return stream_file(handle, self.wfile, remaining, chunk=chunk)
+
+    def _speed_report(self) -> None:
+        payload = json.dumps({
+            "adaptive": ADAPTIVE_RANGE,
+            "target_seconds": RANGE_TARGET_SECONDS,
+            "max_bytes": MAX_OPEN_RANGE_SEND,
+            "clients": _CLIENT_SPEEDS.snapshot(),
+        }, ensure_ascii=False).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(payload)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(payload)
 
     def _jf_pack(self) -> None:
         query = parse_qs(urlsplit(self.path).query)
