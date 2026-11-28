@@ -25,6 +25,21 @@ python -m dvpack pack  <原片.mkv> -o _out/demo --seconds 60
 python -m dvpack serve _out/dv_p7_fix      # 起局域网服务（打印给 aTV 的地址）
 ```
 
+电视原生播放器链路是**另一套色彩口径**（v35）：不切 HLS，出一个完整 MP4 放回 NAS
+让电视自带媒体中心浏览。Apple 那条要「色彩留白、全靠带内 RPU」，电视原生这条要
+**显式签满** limited + BT.2020/PQ/BT.2020nc + `dvh1`/`dvcC`——原片 `color_range=pc`
+在这类固件上的症状就是偏色 + 徽标不亮。信令位域仍只有 `remux` 一处实现，这里不重写。
+
+```
+python -m dvpack audit  /mnt/movie2 --csv _scratch/native-audit.csv   # 只读分类，先看清要修谁
+python -m dvpack native /mnt/movie2 -o _out/native --dry-run          # 只打印命令，不落盘
+python -m dvpack native /mnt/movie2 -o _out/native --limit 3          # 先出 3 部上真机看徽标
+```
+
+原片一律只读：产物写进 `-o` 并保持库内目录层级（`山/1080p.mkv` → `山/1080p-dv.mp4`）；
+每个产物出完立刻复检（ffprobe 复读 + 有界拆 moov 验 `dvh1`/`dvcC` + 抽 8s 验带内 RPU），
+**复检不过就地删产物**，绝不留一个看着像成片的东西；磁盘余量不足（`--reserve`，默认 2GB）自动停批。
+
 Jellyfin 片库的实时链路由 serve 的 `/jf/pack`、`/jf/poster`、`/jf/purge`
 端点驱动（点片 → 秒开 20s + 后台全片并行补），CLI 主要用于验收单个文件。
 

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import os
 import struct
+import tempfile
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
@@ -26,6 +27,7 @@ from .dvprofile import (
     RPU_NAL_PREFIX,
     RPU_NAL_TYPES,
 )
+from .dvconfig import DvcConfig
 
 VIDEO_SAMPLE_ENTRIES = DV_SAMPLE_ENTRIES | NON_DV_SAMPLE_ENTRIES
 
@@ -485,14 +487,18 @@ def hvcC_param_set_types(data: bytes) -> tuple[int, ...]:
     参数集明明齐全（nal_types 32/33/34 都有），但 Apple 不从分片反哺 init，
     "播了但立刻失败"就是这么来的。
     """
-    trees = _parse_siblings(data, 0, len(data), 1)
-    hvcc = next((box for tree in trees for box in tree.find_all("hvcC")), None)
-    if hvcc is None:
-        return ()
-    payload = data[hvcc.offset + 8 : hvcc.offset + hvcc.size]
+    return tuple(sorted({nal_type for nal_type, _ in hvcC_param_sets(data)}))
+
+
+def _hvcC_arrays(payload: bytes) -> tuple[tuple[int, bytes], ...]:
+    """解析 HEVCDecoderConfigurationRecord 载荷（box header 之后）的参数集数组区。
+
+    返回 (数组声明的 NAL 类型, NAL 字节) 序列。NAL 头类型与数组声明不一致时
+    丢弃该条——声明与实物对不上，拿它当判据就是把错当证据。
+    """
     if len(payload) < 23:
         return ()
-    types: list[int] = []
+    found: list[tuple[int, bytes]] = []
     cursor = 23
     for _ in range(payload[22]):
         if cursor + 3 > len(payload):
@@ -509,9 +515,121 @@ def hvcC_param_set_types(data: bytes) -> tuple[int, ...]:
                 break
             # NAL 头第 1 字节：forbidden(1)+type(6)，类型在高 6 位，要右移
             if (payload[cursor] >> 1) & 0x3F == nal_type:
-                types.append(nal_type)
+                found.append((nal_type, payload[cursor : cursor + length]))
             cursor += length
-    return tuple(sorted(set(types)))
+    return tuple(found)
+
+
+def hvcC_param_sets(data: bytes) -> tuple[tuple[int, bytes], ...]:
+    """init 段 hvcC 里已收录的参数集 NAL（(类型, NAL 字节) 序列，含 SEI 等非参数集数组）。
+
+    与 hvcC_param_set_types 同一套解析，只多带回 NAL 本体：只报类型分不出
+    "同一个 33 到底是哪条 SPS"，而并段安全闸要判的正是「同一套参数集」。
+    """
+    trees = _parse_siblings(data, 0, len(data), 1)
+    hvcc = next((box for tree in trees for box in tree.find_all("hvcC")), None)
+    if hvcc is None:
+        return ()
+    return _hvcC_arrays(data[hvcc.offset + 8 : hvcc.offset + hvcc.size])
+
+
+def _entry_decode_signature(entry: Box, data: bytes) -> tuple:
+    """一个 sample entry 的「可解码」签名：fourcc + 各子盒（hvcC 归一化后）的字节。
+
+    hvcC 只取 23 字节固定头 + VPS/SPS/PPS：数组 completeness 标志、entry 数量、
+    movenc 追加的前缀 SEI(39) 数组都不改变解码能力，逐字节比对会把同一套流
+    误判成两套（2026-11-08 真机采样，见 init_stream_compatible）。
+    """
+    children: list[tuple[str, object]] = []
+    for child in entry.children:
+        payload = data[child.offset + 8 : child.offset + child.size]
+        if child.type == "hvcC":
+            children.append(("hvcC", (
+                # 固定头取前 22 字节：第 23 字节是 numOfArrays，数组条数随
+                # movenc 追加 SEI 数组而变，与解码能力无关。
+                payload[:22],
+                tuple(item for item in _hvcC_arrays(payload)
+                      if item[0] in _MANDATORY_PARAM_SETS),
+            )))
+        else:
+            children.append((child.type, payload))
+    return (entry.type, tuple(sorted(children, key=lambda item: item[0])))
+
+
+def init_stream_signatures(data: bytes) -> tuple[tuple[str, frozenset], ...] | None:
+    """init 段的每轨可解码签名：((handler, {entry 签名, ...}), ...)，按 handler 排序。
+
+    返回 None 表示这不是能解析的 init 段（没有 moov / 没有轨 / 有轨没有 stsd），
+    调用方应退回逐字节比较，别把"解析不了"当成"不兼容"。
+    """
+    trees = _parse_siblings(data, 0, len(data), 1)
+    moov = next((tree for tree in trees if tree.type == "moov"), None)
+    if moov is None:
+        return None
+    tracks: list[tuple[str, frozenset]] = []
+    for trak in moov.find_all("trak"):
+        handler = _handler(trak, data)
+        stsd = next(iter(trak.find_all("stsd")), None)
+        if handler is None or stsd is None or not stsd.children:
+            return None
+        tracks.append((handler, frozenset(
+            _entry_decode_signature(entry, data) for entry in stsd.children)))
+    if not tracks:
+        return None
+    return tuple(sorted(tracks, key=lambda item: item[0]))
+
+
+def _entry_gap(left: tuple, right: tuple) -> str:
+    """两个 entry 签名差在哪——给并段放弃时的日志一句人能看懂的原因。"""
+    if left[0] != right[0]:
+        return f"sample entry {left[0]} vs {right[0]}"
+    lkids, rkids = dict(left[1]), dict(right[1])
+    for name in sorted(set(lkids) | set(rkids)):
+        if lkids.get(name) == rkids.get(name):
+            continue
+        if name == "hvcC":
+            ltypes = [nal_type for nal_type, _ in lkids[name][1]]
+            rtypes = [nal_type for nal_type, _ in rkids[name][1]]
+            if ltypes != rtypes:
+                return f"hvcC 参数集 {ltypes} vs {rtypes}"
+            return "hvcC 参数集内容不同"
+        return f"{name} 盒不同"
+    return "sample entry 不同"
+
+
+def init_stream_compatible(a: bytes, b: bytes) -> tuple[bool, str]:
+    """两份 init 段是否描述同一套可解码流。返回 (结论, 不兼容原因)。
+
+    逐字节相同是充分条件、不是必要条件。2026-11-08 真机采样（dvpack de741a）：
+    同一片源的 20 秒秒开 stub 与全片后台包，init 只差三处不影响解码的东西——
+    movenc 追加的第二个 dvh1 entry（分片 tfhd 无覆盖，只引 entry0）、
+    hvcC 数组 completeness 标志（0xa0→0x20）、多出来的前缀 SEI(39) 数组；
+    VPS/SPS/PPS、dvcC、colr、pasp、音轨逐字节全同，前两个分片也逐字节相同。
+    按字节判会把这种包整体放弃并段，电视停在 20 秒处转圈。
+
+    真正会改变解码能力的差异——参数集内容、DV 配置、色彩信令、音轨配置、
+    sample entry fourcc——仍然一律判不兼容。
+    """
+    left = init_stream_signatures(a)
+    right = init_stream_signatures(b)
+    if left is None or right is None:
+        return (a == b, "" if a == b else "init 段不是可解析的 ISOBMFF")
+    if left == right:
+        return True, ""
+    lhandlers = {handler for handler, _ in left}
+    rhandlers = {handler for handler, _ in right}
+    if lhandlers != rhandlers:
+        return False, f"轨不同 {sorted(lhandlers)} vs {sorted(rhandlers)}"
+    for (handler, lentries), (_, rentries) in zip(left, right):
+        only_left = lentries - rentries
+        only_right = rentries - lentries
+        if only_left or only_right:
+            first_left = next(iter(only_left)) if only_left else next(iter(only_right))
+            first_right = next(iter(only_right)) if only_right else next(iter(only_left))
+            return False, f"{handler} 轨{_entry_gap(first_left, first_right)}"
+    return False, "签名不同"
+
+
 
 
 def dedupe_hvcC_parameter_sets(data: bytes) -> tuple[bytes, int]:
@@ -816,20 +934,23 @@ def clamp_dvcC_level(data: bytes, level: int) -> tuple[bytes, int | None]:
     只降不升：源签得比分辨率档位还保守时不动，不把能力签高。dvcC 无校验和，
     改 dv_level 所在字节即可；定位走 locate_dv_boxes 的绝对偏移。
 
-    dvcC 位域（2026-10-02 用三个样本互证标定）：payload[2] 高 7 位是
-    dv_profile、低 1 位是 rpu_present_flag；payload[3] 高 5 位是 dv_level、
-    低 3 位是 el/bl 等存在位。实测 0x4d→9（不亮版）、0x35→6（点亮版）、
-    0x1d→3（Apple 1080p 官方参考流），一律 level<<3 | flags。
+    dvcC 位域（2026-10-02 三样本互证 + Dolby spec 布局核对）：16 个 payload
+    位是 profile(7) → level(6) → rpu/el/bl present(各 1)。payload[2] 高 7 位
+    是 dv_profile、低 1 位是 dv_level 的最高位（真实 level≤13 恒为 0）；
+    payload[3] 高 5 位是 dv_level 低 5 位、低 3 位是 rpu/el/bl present。
+    本函数只动 payload[3]（(level & 0x1f)<<3 | 原低 3 位），对真实 level
+    1-13 语义正确。实测 0x4d→9（不亮版）、0x35→6（点亮版）、0x1d→3
+    （Apple 1080p 官方参考流）。
     """
     for box in locate_dv_boxes(data):
-        if box.fourcc != "dvcC" or len(box.payload) < 4:
+        if box.fourcc != "dvcC" or len(box.payload) < 5:
             continue
-        current = box.payload[3] >> 3
-        if current <= level:
+        config = DvcConfig.parse(bytes(box.payload))
+        if config.level <= level:
             return data, None
         buf = bytearray(data)
-        buf[box.payload_offset + 3] = (level << 3) | (box.payload[3] & 0x07)
-        return bytes(buf), current
+        buf[box.payload_offset + 3] = ((level & 0x1F) << 3) | (box.payload[3] & 0x07)
+        return bytes(buf), config.level
     return data, None
 
 
@@ -879,12 +1000,23 @@ def atomic_write(path: Path, data: bytes) -> None:
     拉完 200 后静默停播——比失败更难排查。临时文件与目标同文件系统，
     os.replace 的替换是原子的，读者只会见到旧文件或新文件。
     """
-    tmp = path.with_name(f"{path.name}.tmp")
-    with open(tmp, "wb") as handle:
-        handle.write(bytes(data))
-        handle.flush()
-        os.fsync(handle.fileno())
-    os.replace(tmp, path)
+    # 临时文件名唯一化：固定 ".tmp" 名在多进程同时 fix-up 时会撞车（2026-09-26
+    # init.mp4 被截 0 字节事故的头号嫌疑）。mkstemp 同目录唯一名，fsync 后
+    # os.replace 原子替换语义不变。
+    fd, tmp = tempfile.mkstemp(
+        dir=path.parent, prefix=f"{path.name}.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(bytes(data))
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 # --------------------------------------------------------------------------

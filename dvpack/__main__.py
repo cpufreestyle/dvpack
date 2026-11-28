@@ -6,8 +6,12 @@
     python -m dvpack prewarm _out/dv_p7_fix    # Jellyfin 片库批量预热
     python -m dvpack flow _out/dv_p7_fix/_jf/<id>   # 服务端 FRC 插帧，追加 100fps 变体
     python -m dvpack flow _out/dv_p7_fix/_jf/<id> --remaster  # 只补 master 的 flow 行
+    python -m dvpack audit <片库>              # 电视原生播放器口径：谁要修、谁已合规
+    python -m dvpack native <片库> -o _out/native  # 同口径批量出单个 MP4（不切 HLS，原片只读）
 
 `check` 单独留着是因为片库有 63 个 DV 文件，验收矩阵要逐个判定，不该为了看结论就跑一遍 remux。
+`audit` / `native` 走的是另一条链路（电视原生播放器直连 SMB 文件），色彩口径与 Apple 的
+「留白」相反，必须显式签 limited + BT.2020/PQ，见 `dvpack.native` 模块注释。
 """
 
 from __future__ import annotations
@@ -29,8 +33,11 @@ from .flow import FlowError
 from .serve import lan_address, serve as serve_files
 from . import prewarm
 from . import configcmd
-from . import flow
 from . import subwarm
+from . import subs
+from .dvmeta import DvMetaError, extract_rpu, inject_rpu_m5, scan_fmp4, reshape_rpu_roundtrip
+from . import flow
+from . import native
 
 
 def _check(path: Path) -> int:
@@ -149,6 +156,44 @@ def _init(path: Path) -> int:
     return 0 if ok else 1
 
 
+def _subcheck(path: Path, *, as_json: bool = False) -> int:
+    """subcheck 子命令：体检一个片目录（或批量扫描根）的中英字幕轨对齐。只读。"""
+    import json
+
+    dirs: list[Path] = []
+    if path.is_file():
+        dirs = [path.parent]
+    elif (path / "sub_zh.vtt").is_file() or (path / "sub_en.vtt").is_file():
+        dirs = [path]
+    elif path.is_dir():
+        seen: set[Path] = set()
+        for vtt in sorted(path.glob("**/sub_*.vtt")):
+            if vtt.parent not in seen:
+                seen.add(vtt.parent)
+                dirs.append(vtt.parent)
+    else:
+        print(f"失败：{path} 既不是片目录也不是含字幕的根", file=sys.stderr)
+        return 2
+    if not dirs:
+        print("未发现任何 sub_zh.vtt / sub_en.vtt", file=sys.stderr)
+        return 1
+    reports = [subs.check_subtitle_tracks(d) for d in dirs]
+    if as_json:
+        print(json.dumps(reports, ensure_ascii=False, indent=2))
+        return 0
+    for r in reports:
+        zh = "✓" if r["zh_present"] else "✗"
+        en = "✓" if r["en_present"] else "✗"
+        line = f"{r['dir']}  中文{zh}({r['zh_cues']}) 英文{en}({r['en_cues']})"
+        if "median_s" in r:
+            line += (f"  中位{r['median_s']:+}s IQR{r['iqr_s']}s"
+                     f"  <2s {r['within2_pct']}% >3s {r['over3_pct']}%"
+                     f"  挂后{r['lingering_pct']}%")
+        line += f"  → {r['verdict']}"
+        print(line)
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="dvpack", description="杜比视界 HLS 打包与投喂")
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -179,6 +224,24 @@ def main(argv: list[str] | None = None) -> int:
                         help="Jellyfin 全库字幕批量预热：中英双语提前抓进 L2 _subs 缓存")
     subwarm.add_arguments(sw)
 
+    sc = sub.add_parser("subcheck", help="逐片体检：中/英字幕轨是否对齐（只读，不动文件）")
+    sc.add_argument("path", type=Path,
+                    help="片目录（含 sub_zh.vtt/sub_en.vtt），或含多个片目录的根（批量扫描）")
+    sc.add_argument("--json", action="store_true", help="输出 JSON（脚本消费用）")
+
+    au = sub.add_parser("audit", help="片库审计：按电视原生播放器口径分类（只读，不动文件）")
+    native.add_arguments(au)
+    nv = sub.add_parser("native", help="电视原生播放器链路：批量重封装成单个 MP4（原片只读）")
+    native.add_arguments(nv)
+
+    dm = sub.add_parser("dvmeta", help="DV 动态元数据（RPU）诊断与 reshape")
+    dm_sub = dm.add_subparsers(dest="dm_cmd", required=True)
+    dm_scan = dm_sub.add_parser("scan", help="RPU 存在性普查（纯 Python，不调外部进程）")
+    dm_scan.add_argument("path", type=Path, help="fmp4/MP4 文件")
+    dm_reshape = dm_sub.add_parser("reshape", help="extract-rpu → inject-m5 → 核对")
+    dm_reshape.add_argument("path", type=Path, help="fmp4/MP4 文件")
+    dm_reshape.add_argument("-o", "--out", type=Path, default=None, help="输出路径（默认 <stem>.m5<ext>）")
+
     args = parser.parse_args(argv)
     try:
         if args.cmd == "check":
@@ -195,6 +258,17 @@ def main(argv: list[str] | None = None) -> int:
             return flow.run_from_args(args)
         if args.cmd == "subwarm":
             return subwarm.run_from_args(args)
+        if args.cmd == "subcheck":
+            return _subcheck(args.path, as_json=args.json)
+        if args.cmd == "audit":
+            return native.run_from_args(args, fix=False)
+        if args.cmd == "native":
+            return native.run_from_args(args, fix=True)
+        if args.cmd == "dvmeta":
+            if args.dm_cmd == "scan":
+                return _dvmeta_scan(args.path)
+            if args.dm_cmd == "reshape":
+                return _dvmeta_reshape(args.path, args.out)
         return _serve(args.root, args.port, args.host)
     except (RemuxError, FlowError, UnknownTransfer, FileNotFoundError) as exc:
         print(f"失败：{exc}", file=sys.stderr)
@@ -203,3 +277,41 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+def _dvmeta_scan(path: Path) -> int:
+    """scan 子命令：用纯 Python 对 fmp4/MP4 做 RPU 存在性普查。"""
+    scan = scan_fmp4(path)
+    print(f"文件 : {path}")
+    print(f"NALU 长度前缀 : {scan.nalu_length_size} 字节")
+    print(scan.summary())
+    if not scan.rpu_present:
+        print("结论 : 无 RPU —— DV 徽标无法点亮，考虑走 dvmeta reshape 路径")
+        return 1
+    if scan.missing_frames:
+        print(f"结论 : RPU 不完整（{len(scan.missing_frames)} 帧缺失），建议走 reshape")
+        return 1
+    print("结论 : RPU 完整，每帧覆盖")
+    return 0
+
+
+def _dvmeta_reshape(path: Path, out: Path | None) -> int:
+    """reshape 子命令：extract-rpu → inject-m5 → 核对。"""
+    try:
+        m5_path, before, after = reshape_rpu_roundtrip(
+            path, keep_intermediates=False
+        )
+    except DvMetaError as exc:
+        print(f"失败：{exc}", file=sys.stderr)
+        return 2
+    if out and out != m5_path:
+        m5_path.rename(out)
+        m5_path = out
+    print(f"产物   : {m5_path}")
+    print(f"注入前 : {before.summary()}")
+    print(f"注入后 : {after.summary()}")
+    if after.missing_frames:
+        print(f"警告：注入后仍有 {len(after.missing_frames)} 帧缺 RPU", file=sys.stderr)
+        return 1
+    print("结论 : reshape 完成，每帧 RPU 覆盖")
+    return 0
+

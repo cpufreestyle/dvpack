@@ -15,6 +15,8 @@ from __future__ import annotations
 
 import math
 import re
+import statistics
+from bisect import bisect_right
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping, Sequence
@@ -151,6 +153,66 @@ def _normalize_timing_line(line: str) -> str:
     if _ARROW in line:
         return line.replace(",", ".")
     return line
+def _fmt_ts(seconds: float) -> str:
+    """秒 -> 00:00:00.000 WebVTT 时间戳。"""
+    h = int(seconds // 3600)
+    m = int((seconds % 3600) // 60)
+    s = seconds % 60
+    return f"{h:02d}:{m:02d}:{s:06.3f}"
+
+
+def _parse_vtt_cues(data: bytes) -> list[tuple[float, float, str]]:
+    """把 WebVTT 字节解析成 (start, end, text) 列表。"""
+    text = data.decode("utf-8", "replace")
+    lines = text.split("\n")
+    cues: list[tuple[float, float, str]] = []
+    i = 0
+    while i < len(lines):
+        line = lines[i].strip()
+        if _ARROW in line:
+            left, _, right = line.partition(_ARROW)
+            start, stop = _stamp(left), _stamp(right)
+            if start is not None and stop is not None and stop > start:
+                j = i + 1
+                body_lines: list[str] = []
+                while j < len(lines) and lines[j].strip():
+                    body_lines.append(lines[j])
+                    j += 1
+                cues.append((start, stop, "\n".join(body_lines)))
+            i = j
+        else:
+            i += 1
+    return cues
+
+
+def _dedupe_en_cues(data: bytes) -> bytes:
+    """英文字幕同一时间只保留一条 cue，避免双语字幕时英文重复多行。
+
+    规则：按开始时间排序，若当前 cue 与上一条保留的 cue 时间重叠
+    且正文相同，则合并时段；若时间重叠且正文不同，保留较长者。
+    输出 WebVTT 字节，英文贴屏幕最底（position:100% line:100% align:end）。
+    """
+    cues = _parse_vtt_cues(data)
+    if not cues:
+        return data
+    cues.sort(key=lambda c: c[0])
+    kept: list[tuple[float, float, str]] = []
+    for start, stop, text in cues:
+        if kept and start - kept[-1][1] < 0.5 and text.strip() == kept[-1][2].strip():
+            kept[-1] = (kept[-1][0], max(kept[-1][1], stop), kept[-1][2])
+        elif kept and start < kept[-1][1]:
+            if len(text) >= len(kept[-1][2]):
+                kept[-1] = (start, stop, text)
+        else:
+            kept.append((start, stop, text))
+    out = ["WEBVTT", ""]
+    for start, stop, text in kept:
+        out.append(f"{_fmt_ts(start)} --> {_fmt_ts(stop)}")
+        out.append(text)
+        out.append("")
+    return ("\n".join(out).rstrip("\n") + "\n").encode("utf-8")
+
+
 
 
 def to_vtt(text: str) -> bytes:
@@ -196,7 +258,9 @@ def subtitle_playlist_text(
     spans = [span for span in chunks if span[1] > span[0]]
     first_cue = None
     for index, (start, stop) in enumerate(spans):
-        if arrow in data[start:stop]:
+        # 跳过 0 时长 cue：头段合并跨度直到首条可用 cue，中间坏 cue 的文本
+        # 仍被合并段带出去，避免「0 时长段被滤掉 → WEBVTT 头跟着丢」。
+        if arrow in data[start:stop] and _cue_seconds(data[start:stop]) > 0:
             first_cue = index
             break
     if first_cue is None:
@@ -236,6 +300,9 @@ def write_subtitle_tracks(out_dir: str | Path, texts: Mapping[str, str]) -> list
         if not text or not text.strip():
             continue
         payload = to_vtt(text)
+        # 英文去重一行、贴最底；中文保持原样
+        if language == "en":
+            payload = _dedupe_en_cues(payload)
         vtt = base / f"sub_{language}.vtt"
         vtt.write_bytes(payload)
         track = SubtitleTrack(language=language, name=name, vtt=vtt, default=default)
@@ -287,3 +354,99 @@ def upgrade_master_subtitles(
 
     write_master_playlist(master, [variant], subtitles=tracks)
     return tracks
+
+
+# ---- 逐片体检：中/英字幕轨对齐诊断（只读，不动任何文件）----
+#
+# 用户报「中文有时慢于英文」。真相分两类，靠肉眼在电视上分不清，故做此体检：
+#   1) 单语片：源里只有一条语言的字幕流（实测 1f23…=仅英、c809…=仅中）。
+#      表现为英文在出、中文始终没有——是片库缺轨，不是错位，App 修不了。
+#   2) 双语片：两条独立作者的字幕文件各自贴视频。绝大多数起点同步（7ada 中位 0
+#      IQR 0、>3s 占 0%），少数整片被固定平移（可对中文轨加单独延迟修正），
+#      或忽早忽晚的发散（源数据，固定偏移修不干净）。
+# 判据用「同屏重叠配对」而非「最近起点」：英文轨更密时，最近起点会把差值压向 0、
+# 掩盖真偏移；改成取与某条中文 cue 区间重叠最多的英文 cue，量的就是「同一时刻屏幕
+# 上这两句各自何时开始、谁先说完」，更贴观感。
+
+def _overlap_diffs(
+    zh: list[tuple[float, float, str]],
+    en: list[tuple[float, float, str]],
+    *, window: float = 0.5,
+) -> tuple[list[float], list[float], int]:
+    """按同屏重叠配对。返回 (起点差 zh-en 列表, 中文比英文多挂时长列表, 漏配数)。"""
+    zh, en = sorted(zh), sorted(en)
+    en_starts = [c[0] for c in en]
+    diffs: list[float] = []
+    lingering: list[float] = []
+    unmatched = 0
+    for s, e, _ in zh:
+        mid = (s + e) / 2
+        i = bisect_right(en_starts, mid) - 1
+        best_ov, pair = -1.0, None
+        for j in (i - 1, i, i + 1):
+            if 0 <= j < len(en):
+                ov = min(e, en[j][1]) - max(s, en[j][0])
+                if ov > best_ov:
+                    best_ov, pair = ov, en[j]
+        if pair is None or best_ov <= window:
+            unmatched += 1
+            continue
+        diffs.append(s - pair[0])            # >0：中文起点晚于英文
+        lingering.append(max(0.0, e - pair[1]))  # 中文比英文多挂多久（粗分句观感来源）
+    return diffs, lingering, unmatched
+
+
+def bilingual_timing_report(
+    zh_bytes: bytes | None, en_bytes: bytes | None
+) -> dict:
+    """给两条 .vtt 字节，判中英是 对齐 / 固定偏移 / 单语 / 发散。"""
+    zh = _parse_vtt_cues(zh_bytes or b"")
+    en = _parse_vtt_cues(en_bytes or b"")
+    rep = {"zh_cues": len(zh), "en_cues": len(en),
+           "zh_present": bool(zh), "en_present": bool(en)}
+    if not zh and not en:
+        rep["verdict"] = "无字幕轨"
+        return rep
+    if not zh or not en:
+        rep["verdict"] = f"单语字幕（只有{'英文' if en else '中文'}；另一语言源里没轨，非错位）"
+        return rep
+    diffs, lingering, unmatched = _overlap_diffs(zh, en)
+    if len(diffs) < 10:
+        rep["verdict"] = "样本太少，无法判定"
+        return rep
+    vs = sorted(diffs)
+    n = len(vs)
+    med = statistics.median(vs)
+    p25, p75 = vs[n // 4], vs[min(n - 1, (n * 3) // 4)]
+    absd = [abs(d) for d in vs]
+    pct2 = sum(1 for d in absd if d < 2.0) / n
+    pct3 = sum(1 for d in absd if d > 3.0) / n
+    hold = [x for x in lingering if x > 0.8]
+    rep.update({
+        "paired": n, "unmatched": unmatched,
+        "median_s": round(med, 2), "iqr_s": round(p75 - p25, 2),
+        "min_s": round(vs[0], 2), "max_s": round(vs[-1], 2),
+        "within2_pct": round(pct2 * 100), "over3_pct": round(pct3 * 100),
+        "lingering_pct": round(len(hold) / n * 100),
+        "lingering_med_s": round(statistics.median(hold), 2) if hold else 0.0,
+    })
+    if abs(med) >= 1.0 and (p75 - p25) < 1.5:
+        rep["verdict"] = "整体固定偏移（可对中文轨加单独延迟修正）"
+    elif pct3 < 0.10 and abs(med) < 1.0:
+        rep["verdict"] = "基本同步，零星噪声（别动）"
+    else:
+        rep["verdict"] = "时间轴发散（两份独立字幕文件，固定偏移修不干净）"
+    return rep
+
+
+def check_subtitle_tracks(title_dir: str | Path) -> dict:
+    """读一个片目录里的 sub_zh.vtt / sub_en.vtt 出体检报告（只读）。"""
+    d = Path(title_dir)
+
+    def _read(name: str) -> bytes | None:
+        p = d / name
+        return p.read_bytes() if p.is_file() else None
+
+    rep = bilingual_timing_report(_read("sub_zh.vtt"), _read("sub_en.vtt"))
+    rep["dir"] = str(d)
+    return rep

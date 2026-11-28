@@ -432,6 +432,11 @@ def hls_command(
     bsf: tuple[str, ...] | None = None,
     setts: str | None = None,
     transcode_audio: bool = False,
+    #: VOD = 定长包、进程退出才落最终列表（带 ENDLIST）；EVENT = 边编码边写
+    # 列表。并段续播要 EVENT：grower 靠读 tmp/video.m3u8 才知道全片包已经
+    # 封了哪些段，VOD 口径下这份列表要到 ffmpeg 退出才存在，并段永远为空转
+    #: （2026-11-07 实测：VOD + hls_list_size 0 时编码中 video.m3u8 不存在）。
+    playlist_type: str = "vod",
 ) -> list[str]:
     """拼 ffmpeg argv。
 
@@ -483,8 +488,10 @@ def hls_command(
         "0",
         # VOD 口径（Apple 参考流同款 #EXT-X-PLAYLIST-TYPE:VOD）：定长包
         # 明示没有更多分片，AVPlayer 不会守着列表等追加。
+        # playlist_type="event" 只在全片后台打包时用：那份包要能被 grower
+        # 增量读到，换装前再由 serve._seal_full_playlist 收成 VOD+ENDLIST。
         "-hls_playlist_type",
-        "vod",
+        playlist_type,
         str(playlist),
     ]
     return argv

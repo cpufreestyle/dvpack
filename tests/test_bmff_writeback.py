@@ -38,7 +38,7 @@ def _sample_entry(compressor: str | None = None, dv_level: int | None = None) ->
     """造一个 dvh1 VisualSampleEntry：fixed fields 加可选的 dvcC 子 box。"""
     children = b""
     if dv_level is not None:
-        children += _box(b"dvcC", bytes([5, 0, 0, dv_level]))
+        children += _box(b"dvcC", bytes([1, 0, 0x0A, dv_level]) + b"\x00" * 19)
     entry = bytearray(8 + _VISUAL_EXTRA + len(children))
     entry[0:4] = struct.pack(">I", len(entry))
     entry[4:8] = b"dvh1"
@@ -63,7 +63,11 @@ def _wrap_stsd(entry: bytes) -> bytes:
 
 
 def _init_with_dvcC(level_byte: int) -> bytes:
-    """level_byte 是 dvcC payload[3]：高 5 位 dv_level、低 3 位 el/bl 标志。"""
+    """level_byte 是 dvcC payload[3]：高 5 位 dv_level、低 3 位 el/bl 标志。
+
+    payload 用规范 24 字节形（P5 模板 `01 00 0a <level> 00*19`），与真实
+    dvcC 同长——4 字节的旧夹具是病态形状，DvcConfig.parse 拒收。
+    """
     return _wrap_stsd(_sample_entry(dv_level=level_byte))
 
 
@@ -126,10 +130,12 @@ class TestClampDvcCLevel:
         assert payload[3] & 0x07 == 0b101
 
     def test_preserves_profile_byte(self):
-        """只动 payload[1]，profile 位域（payload[0]）不许被碰。"""
+        """只动 payload[3]，version/profile 位域（payload[0..2]）不许被碰。"""
         data = _init_with_dvcC(9 << 3)
         out, _ = clamp_dvcC_level(data, 6)
-        assert locate_dv_boxes(out)[0].payload[0] == 5
+        payload = locate_dv_boxes(out)[0].payload
+        assert payload[0] == 1     # version_major 原样
+        assert payload[2] == 0x0A  # profile(7)|level[5] 原样：P5、level<32 时低位恒 0
 
     def test_only_one_byte_differs(self):
         data = _init_with_dvcC(9 << 3)

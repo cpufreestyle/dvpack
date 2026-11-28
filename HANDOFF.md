@@ -1,3 +1,414 @@
+# HANDOFF v36 (2026-11-28 23:22) — 新增 `dvpack subcheck`：逐片中/英字幕轨体检（只读）
+
+## 一句话结论
+用户报「中文有时慢于英文」。查明：**字幕数据本身没有相对错位**——双语片（7ada/ae129）
+用「同屏重叠配对」量得起点中位 +0.0s、IQR 0.0s、>3s 占 0~1%、英文说完中文仍挂着的
+比例≈0；所谓「中文慢」绝大多数其实是**逐片轨可用性不对称**：库里 `1f23…` 只有英文轨、
+`c809…` 只有中文轨，另一语言源里压根没字幕流（不是错位、App 与 dvpack 都修不了）。
+为把这个肉眼在电视上分不清的区分固化下来，加一条只读体检命令。
+
+## 根因链（为什么不是错位）
+- `jfpack.fetch_subtitle_texts` 把源里**两条独立字幕流**分别落成 `sub_zh.vtt`/`sub_en.vtt`
+  （各作者、各自时间轴，均贴视频）。`subs.write_subtitle_tracks` 里 zh 先写 en 后写；
+  两条 .vtt **同秒落盘**，排除「在线腿把中文轨写得比英文晚」的竞态。
+- dvplay `SubtitleEngine.tick` 用同一个 `pos = seconds - delaySeconds` 分别查两条轨
+  （`ContentView.swift:3184`），故 `delaySeconds` 对两条轨**同时生效**，修不了二者相对错位。
+  实测双语片中位偏移≈0 → 全局延迟本就不该为「中英相对」去动，动了反把同步的 97% 拖歪。
+- 真凶是 **单语片**：UDP 遥测里 `subtitle: retry … zh=0 en=143` 一路到 580s —— `1f23…`
+  只有 `sub_en.vtt`，中文轨永远 0，英文在出、中文从不出 → 观感即「中文比英文慢/没有」。
+
+## 新命令 `dvpack subcheck <path> [--json]`（`dvpack/subs.py` + `dvpack/__main__.py`）
+- path 可给：片目录（含 sub_zh.vtt/sub_en.vtt）、某个 sub_*.vtt 文件（取同目录）、
+  或含多个片目录的根（`**/sub_*.vtt` 批量扫描，按父目录去重）。
+- 只读，靠 `subs.check_subtitle_tracks` → `bilingual_timing_report`，判据用 `_overlap_diffs`
+  （同屏区间重叠配对，比「最近起点」少偏，英文轨更密时不会把差值压向 0 掩盖真偏移）。
+- 判定四类：`无字幕轨` / `单语字幕（只有X；另一语言源里没轨，非错位）` /
+  `整体固定偏移（可对中文轨加单独延迟修正）` / `基本同步，零星噪声（别动）` /
+  `时间轴发散（两份独立字幕文件，固定偏移修不干净）`。
+- 实测四片：1f23 仅英、c809 仅中、7ada 与 ae129 均「基本同步，别动」。
+
+## 口径与边界
+- 「可对中文轨加单独延迟修正」只描述**当前源数据**（两条 .vtt 的整体相对平移），
+  不代表 App 已有中文单独偏移控件——那个仍未做（单语片加它也没用，故先不动 UI）。
+- 「挂后」列 = 中文 cue 比同屏英文 cue 多显示的时长占比，用于解释「粗分句合并造成的
+  英文先走、中文落后」观感；双语片里此值≈1~3%，属正常分句粒度差，非 bug。
+- 未 `git commit`。本轮仅动 `dvpack/subs.py`（新增诊断函数 + `import statistics`/`bisect_right`）
+  与 `dvpack/__main__.py`（注册 `subcheck` 子命令 + `_subcheck`）。
+
+---
+
+# HANDOFF v35 (2026-11-28 19:55) — 新增 `dvpack audit` / `dvpack native`：电视原生播放器链路的批量重封装
+
+## 一句话结论
+TCL Q10G 那条「重封装成单个 MP4 → 放回 NAS → 电视自带媒体中心播」的链路，
+以前只有手抄的 ffmpeg 命令行；本轮把它固化成 `dvpack native`（批量出片 + 自检 +
+原片只读）与 `dvpack audit`（片库分类：谁要修 / 谁已合规 / 谁该跳过），
+并在真 DV 流上闭环验证：**产物与 2026-11-22 真机已验收样本 19 项信令逐字段相同**。
+
+## 1. 为什么另起一条链，而不是复用 `pack`
+两条链的色彩口径**相反**，混用会互相打脸：
+- Apple tvOS（`pack`）：init 段色彩留白，全交给带内 RPU（`remux.DV_LEAVE_COLORIMETRY_UNSPECIFIED` 注释）。
+- 电视原生播放器（`native`）：容器 colr + SPS VUI 都要**显式**签
+  limited + BT.2020/PQ/BT.2020nc + `dvh1`/`dvcC`。原片 `color_range=pc` 的直接症状
+  是「画面偏色 + 徽标不亮」（tcl-q10g-tv-opt §3.2 根因 A，真机验收）。
+DV 信令位域仍然只有 `dvconfig`/`remux` 一处实现：`native` 只调
+`remux.DV_VIDEO_FLAGS` / `colorimetry_flags()` / `dv_signalling_bsf()`，不新写一套。
+输出形态差别：`pack` 切 CMAF 分片 + HLS，`native` 出**一个完整 MP4**。
+
+## 2. 改动
+- 新增 `dvpack/native.py`（509 行）：`classify()` 判据、`inspect()`（ffprobe +
+  有界拆 moov，只读 moov 不拖整片）、`native_command()`、`remux_native()`
+  （临时名 → 复检 → 改名，失败即删产物）、`iter_media()` / `mirror_target()`
+  （保持库内目录层级）、`summarize()` / CSV 报告、磁盘预留停批。
+- `dvpack/__main__.py`：挂 `audit` / `native` 两个子命令（共用 `run_from_args(fix=…)`）。
+- `tests/test_native.py`：19 例，全离线（假 ffprobe JSON + 假 subprocess），
+  锁住两个真跑挂过的行为，见 §4。
+- 用法：
+  ```
+  python -m dvpack audit  /mnt/movie2 --csv _scratch/native-audit.csv
+  python -m dvpack native /mnt/movie2 -o _out/native --dry-run
+  python -m dvpack native /mnt/movie2 -o _out/native --limit 3   # 先出 3 部上真机看徽标
+  ```
+
+## 3. 验证（真 DV 流，非合成）
+输入是 tcl-q10g-tv-opt 那份**已真机验收**的 30s P5 样本（`adb pull` 自电视
+`/sdcard/Download/tcl-dv-fixed-30s.mp4`，54,940,651 字节，md5 51133ed8c1055131c3612f8817d8b9d2）。
+把它降级成缺陷形态再走本工具修回来：
+| 文件 | 制造出的缺陷 | audit 判定 | native 结果 |
+|---|---|---|---|
+| `already-ok.mp4` | 无（就是验收样本） | `ok`（dvh1+dvcC） | 不动 |
+| `pc-full.mkv` | MKV 容器 + `color_range=pc` | `fix`（两条理由都对） | **fixed**：`tv/bt2020/smpte2084/bt2020nc dvh1+dvcC RPU=57387B` |
+| `lost-docc.mp4` | `-c copy` 不给 `-strict unofficial` 洗过，fourcc 还是 dvh1 但 dvcC 丢了 | `fix`（识别为「dvcC 丢失」而非「非 DV」） | **verify-fail，产物删除**（见 §4 第 4 条） |
+| `hdr10.mp4` | 本机 x265 造的 HDR10 非 DV 对照 | `skip`（无 DOVI record） | 不动 |
+
+逐字段比对（ffprobe：stream 10 项 + DOVI record 9 项，共 19 项）：`pc-full-dv.mp4` 与已验收样本
+**差异为 0**；`dvpack init` 复读通过（`dvh1` + `dvcC` + hvcC 参数集 [32,33,34]）。
+测试：`pytest -q` → **858 passed / 22 skipped**（基线 839 + 新增 19，无回归）。
+
+## 4. 本轮新踩/新证的四个事实
+1. **临时名的扩展名必须在最后**：ffmpeg 的 mp4 muxer 靠后缀猜容器格式，
+   写成 `x.mp4.part` 直接 `Error opening output files: Invalid argument`。
+   正确写法 `x.part.mp4`（`remux_native` 已按此实现 + 回归测试）。
+2. **`-c copy` 到 MP4 不给 `-strict unofficial` 会静默丢 dvcC**（本机 ffmpeg 8.1.2
+   与自带 9.0.2 都复现，stderr 原文：`Not writing 'dvcC'/'dvvC' box. Requires -strict unofficial.`）：
+   fourcc 由源继承仍是 `dvh1`，DOVI record 却没了（ffprobe 复读不出）。
+   所以判据不能只看 fourcc——这就是 §3 里 `lost-docc.mp4` 那一行的来历，
+   也是 `classify()` 把「fourcc 是 DV 但无 record」归到 `fix` 而不是 `skip` 的原因。
+3. **MP4 + `-c copy` 下 `-color_range` 会被 `-color_*=unspecified` 吞掉**（三组对照实测）：
+   单给 `-color_range pc` 写得出 `pc`；再叠 `-colorspace/-color_primaries/-color_trc unspecified`
+   就复读成 `tv`。要造 full-range 测试样本请走 MKV。
+   `native_command()` 不受影响——它只给显式四件套（tv + bt2020/smpte2084/bt2020nc），从不传 `unspecified`。
+4. **dvcC 一旦被洗掉，重封装救不回来**：ffmpeg 没有 DOVI record 就写不出 dvcC，
+   `native` 对这类文件必然 verify-fail。要救得走带内 RPU 重建配置盒的路子
+   （`dvmeta` 方向），本工具选择**明确失败并删产物**，不产出看着像成片的假货。
+
+## 5. 顺带修正两处旧结论
+- `remux.py` / `bmff.py` 注释写「ffmpeg 写的是俗名 `dvvC`」：
+  本机 ffmpeg 8.1.2 与 `tools/ffmpeg/bin/ffmpeg` **9.0.2** 在
+  `-tag:v dvh1 -strict unofficial` 下写的都是规范名 `dvcC`（`dvpack init` 复读证实）。
+  老版本的 `p5` 转签补救链路仍然保留，但别再照注释假设产物一定是 `dvvC`。
+- tcl-q10g-tv-opt 的 `docs/HANDOFF.md` §3.7 从「手抄 ffmpeg 命令」改成引用本命令，
+  口径出处仍在那边（电视端验收结论），工具与证据链在两边各自留档。
+
+## 6. 待办
+- **片库真跑没做**：本轮 Mac 的终端流量被代理 TUN 接管，到 `192.168.1.1` /
+  `192.168.1.68` 新建连接一律 `No route to host`（只有已建立的 adb 会话能通），
+  所以 `movie2` 没扫成。网络恢复后先 `audit --csv` 看清单，再 `--limit 3` 出片。
+- 真机复验：产物放回 NAS 后由用户肉眼确认徽标（DV 走 secure layer，
+  `adb screencap` 抓不到，这条只能靠眼睛）。
+- P8 单层在这台电视上没验过：`classify()` 目前给 `fix` + 一句「当试验片看待」，
+  要不要像 Apple 那样转签成 P5（`p5.py`）取决于真机结果，先不猜。
+- 字幕没带：验收样本本身无字幕，MP4 里 mov_text 的字幕在这台电视上的表现未知，
+  要加得先真机验（`native_command` 的选流口径注释里记着这条约束）。
+
+# HANDOFF v35b (2026-11-28 18:30) — dvpack 无逻辑改动；配套 dvplay 修掉「卡 0 秒」与 IP 漂移
+
+> 与上一条 v35（`audit` / `native`，19:55）并行产出，故编号加 b 区分。
+
+## 一句话结论
+**本轮 dvpack 侧一行逻辑都没改**：v34 的 hvcC 守门（`dolby_vision and
+drop_param_set_type is not None`）已在位，`tests/test_bmff.py + test_jfpack.py +
+test_playlist.py` 复跑 **105 passed / 0 failed / 9 skipped**。真正修的是客户端
+dvplay（缓存地址不校验 → 连死 IP → 停在 0 秒），详见 `dvplay/HANDOFF.md`
+「2026-11-28 晚」那节。
+
+## 本轮现场（排障用）
+- Mac en0 = **192.168.1.104**（本轮从 .112 漂过来，历史 .109 / .106 / .112 / .104）。
+- serve `:8899` 由 LaunchAgent `com.dvpack.serve` 常驻，root `_out/dv_p7_fix`。
+- 旧 `/tmp/dvpack-serve.log` 的 inode 会被系统清理，进程 fd 指向已删文件 → 读不到
+  日志。重建：
+  `launchctl kickstart -k gui/$(id -u)/com.dvpack.serve`。
+- **Jellyfin `192.168.1.68:8096` 端口关闭**（ping 通、8096 不通），容器需在宿主机
+  重启；在此之前 dvplay 的「自动重登」「片库点片」都无法验证。
+- 海康 NAS `192.168.1.103:8200` 正常，本轮用它做播放链路验收。
+
+## 已验证
+- 缓存包直取正常：`/_jf/nas-5c3605bad119415567bdaba818f42f06/master.m3u8` 200，
+  `video0.m4s` 12559837B、`video1.m4s` 13324255B 均 100% 送达（23.4 / 19.4 Mbps）。
+- 真机（ATV 主卧 00008110-0002149A0A9B801E，**192.168.1.52**）从死地址 `.112` 起播，
+  客户端自愈到 `.104` 后进入 `timeControl=playing`，时间推进 0→10→20→21.42s。
+
+## 待办
+- Jellyfin 容器恢复后，重做「片库点 DV 条目 → /jf/pack → 播放推进」整链验证。
+- `MAX_OPEN_RANGE_SEND` 默认 2MiB 在当前链路（19~23 Mbps）下有效，暂无调整必要；
+  若换回 2.4GHz 弱链路再评估 `DVPACK_RANGE_TARGET_SECONDS`。
+
+# HANDOFF v34 (2026-11-28 14:20) — NAS 影片 502 根因 = 非 DV 源被套了 DV 判据
+
+## 一句话结论
+**海康 NAS（hik.local / 192.168.1.103）上的影片走 `/jf/pack` 报 502，根因是两处把
+HEVC/DV 判据套到了 AVC 片源上。已修复并端到端验证：NAS 影片现在能打包、能出
+master、init 与分片都取得到。**
+
+## 1. 现象与根因
+- 现场：`/jf/pack?src=http://192.168.1.103:8200/MediaItems/60.mp4` → **502 pack failed**
+- 服务端 traceback：`ValueError: init 段里找不到 hvcC box`（`bmff.drop_hvcC_param_set_type`）
+  —— AVC 的配置盒是 `avcC`，`hvcC` 只属于 HEVC。
+- 第二处（修完第一处才暴露）：`remux.verify()` 的 DV 判据把能播的 AVC 包判死，
+  problems = 「sample entry 是 avc1，不是 dvh1」+「hvcC 缺参数集 [32,33,34]」。
+- 第三处（潜在）：`playlist.plain_variant_from_source()` 恒写 `hvc1.*`，
+  AVPlayer 会按 HEVC 去解 AVC 流，起播即失败。
+
+## 2. 改动
+- `dvpack/jfpack.py`
+  - `drop_hvcC_param_set_type` 只在 `dolby_vision` 时执行（非 DV 源不碰 hvcC）。
+  - 新增 `verify_plain(source, output)`：非 DV 源走通用自检（单 sample entry、
+    有分片、时间轴预检），不再套 DV 判据；`pack_source` 按 `dolby_vision` 分流。
+- `dvpack/playlist.py`
+  - 新增 `plain_video_codec(codec_name)`：AVC → `avc1.4D401F`，其余 → `hvc1.*`。
+  - `plain_variant_from_source` 改用它，master 的 CODECS 与实际编码一致。
+
+## 3. 验证
+- 真实 NAS 源打包：`/jf/pack` 返回 200，master 为
+  `CODECS="avc1.4D401F,mp4a.40.2", RESOLUTION=1920x1080, VIDEO-RANGE=SDR`；
+  `video.m3u8` 4 段 + ENDLIST；`init.mp4` 200/1371B；`video0.m4s` 200/12559837B。
+- 测试：`pytest tests/ -q` → **839 passed / 22 skipped / 0 failed**
+  （新增 `tests/test_playlist.py` 两条 AVC 回归 +
+  `tests/test_jfpack.py::test_jfpack_handles_avc_source_without_hvcC`，
+  后者需 `DVPACK_NAS_AVC_URL` 环境变量才跑）。
+- serve 已用新代码重启（`launchctl kickstart -k`）。
+
+## 4. 本轮顺带确认的现场事实
+- 实体 Apple TV「主卧」= `192.168.1.52`，已装 dvplay 0.1.0（build_real_hik，真实设备签名）。
+- 它已经在请求 `/jf/pack`（serve 日志有 `192.168.1.52 GET /jf/pack`）。
+- **Mac 本机 IP 又漂了：en0 = 192.168.1.104**（此前是 .112 / .109 / .106）。
+  `http://192.168.1.112:8899` 已失效，只有 `127.0.0.1:8899` 与 `192.168.1.104:8899` 通。
+  dvplay 侧 `@auto` 自动发现能兜住，但手填旧 IP 的安装会「点片无反应」。
+- `xcrun devicectl device capture screenshot` 在这台 Apple TV 上报
+  `CoreDeviceError 25004` —— 实体机截图这条路目前不通，验收要靠用户看屏幕。
+
+# HANDOFF v33 (2026-11-21 20:30) — M5 RPU 重排接进 /jf/pack 诊断模式（Infuse #6 真机落地）
+
+## 一句话结论
+**Infuse #6 从「工具级」推进到「热路径可真机 A/B」：`/jf/pack?m5=1` 会对 init + 所有分片做 dovi_tool -m 5 inject-rpu 重排，产物落在独立 `_jf/<id>_m5/` 目录，不污染主缓存。**
+服务已用新代码重启（PID 82650）。
+
+## 1. 改动
+- `dvpack/jfpack.py`：`pack_source()` 新增 `rpu_m5: bool = False` 参数。True 时在所有
+  DV 后处理（单 entry / resign / 剥 SEI(39) / colr / dvcC level / compressor）结束后，
+  对 init 段和每一段分别跑 `extract_rpu → inject_rpu_m5 → atomic_write 覆写`。
+  失败时抛 `JfPackError("RPU M5 重排失败：…")`，端点 502。
+- `dvpack/serve.py`：`/jf/pack` 新增 `m5=0|1` query 参数；m5=1 时
+  输出目录改为 `_jf/<id>_m5/`（与主缓存隔离），并在重排后禁用
+  `_need_full_upgrade`（M5 只是诊断包，不让它去后台补全片）。
+- `_send_pack_redirect(item_id, m5=...)`：Location 头里加上 `_m5` 后缀。
+
+## 2. 真机用法（dvplay 侧改 URL 就能切臂）
+- 对照臂（默认）：`http://<host>:8899/jf/pack?src=...&id=<itemId>&seconds=0`
+- M5 诊断臂：`http://<host>:8899/jf/pack?src=...&id=<itemId>&seconds=0&m5=1`
+
+播 10 秒后回答两个问题：
+① 电视 DV 徽标亮不亮？② 颜色对不对（肤色/暗部是否发绿发灰）？
+
+## 3. 验证
+- 全量测试：**837 passed / 21 skipped / 0 failed**（M5 路径需要 dovi_tool 二进制，
+  现有 7 条单测 2 条跳过，行为不变）。
+- 路由测试 `test_seconds_are_clamped` 四个参数化用例全通过（修复了 M5 分支把
+  `else` 吃掉导致 `seconds=0` 走 warm 而不是 instant 的回归）。
+- serve 已重启，PID 82650，`/__speed` 返回 200。
+
+## 4. 注意事项
+- **仅限诊断用**：M5 重排每段要跑一次 dovi_tool，全片包代价太高，所以 m5=1 时
+  强制不补全片（只产出 INSTANT_PACK_SECONDS = 20s），够做 10 秒 A/B 验证。
+- **缓存独立**：M5 产物在 `_jf/<id>_m5/`，主缓存 `_jf/<id>/` 完全不受影响。
+- **失败 502**：dovi_tool 不在 PATH 或 RPU 提取失败都会 502 + 日志里打错误，
+  不会把半坏的包留给客户端。
+
+## 5. 下一步（按优先级）
+1. 真机 A/B：先拿已知能点亮的片，用 m5=1 验证「徽标是否亮 / 颜色是否变」。
+2. 若亮了：考虑把 M5 做成可选默认（profile5_target 走 M5 口径）。
+3. 若不亮：排查 single-fmp4 链路的其他因素（SPS tier、full_range、colr 顺序）。
+
+# HANDOFF v32 (2026-11-21 20:15) — Infuse 6 条全落地；serve 健康运行 4 天
+
+## 一句话结论
+**Infuse 静态学习笔记里的 6 条 dvpack 侧优化建议已全部落地。**
+serve 当前健康运行（PID 4194，已连续 4 天 2 小时），正在给 `c8091dd7…` 做并段打包。
+
+## 1. #6 补充：`dvmeta.py` RPU 动态元数据（2026-11-21 19:26，commit 4821e67）
+- **新增** `dvpack/dvmeta.py`（391 行）：
+  - `RpuFrame` / `RpuScan`：单帧/整片 RPU 存在性建模（Infuse `AVDOVIMetadata` 对应物）
+  - `scan_fmp4(path)`：纯 Python，从 moof/trun 或 stbl 定位样本，统计每帧 RPU NAL
+  - `extract_rpu()`：dovi_tool extract-rpu 包装
+  - `inject_rpu_m5()`：dovi_tool `-m 5` inject-rpu（对应 Infuse `GENERATE_DOVI_RESHAPE`）
+  - `reshape_rpu_roundtrip()`：三步联动，返回 `(m5_path, scan_before, scan_after)`
+- **CLI**：`dvpack dvmeta scan <fmp4>` / `dvpack dvmeta reshape <fmp4>`
+- **测试**：7 passed / 2 skipped（跳过的是 dovi_tool 真跑的 roundtrip，需要二进制存在）
+
+## 2. 六条全部落地对照
+| # | 建议 | 落点 | 状态 |
+|---|---|---|---|
+| 1 | DV profile/level/brand 集中建模 | `dvprofile.py` | 已落地 |
+| 2 | ffmpeg 前盒链 + PTS 静态预检 | `remux.validate_segments()` | 已落地 |
+| 3 | Range-aware 缓存层 | `relay.py` per-URL 32MB LRU | 已落地 |
+| 4 | 多轨共享同一下载流 | relay 缓存共享 probe/poster/字幕 | 已落地 |
+| 5 | 速率统计 → 自适应窗口 | `speed.py` + `serve._respond` + `/__speed` | 已落地 |
+| 6 | RPU 动态元数据 + M5 重排 | `dvmeta.py` | 已落地 |
+
+## 3. 当前服务健康度
+- 进程 PID 4194，启动于 2026-11-17 17:52，已连续运行 **4 天 2 小时**
+- `curl http://127.0.0.1:8899/__speed` → 200
+- 正在并段打包 `c8091dd7f159f5379922562d94feaaea`（已到 502 段）
+- 日志里偶尔有 `[relay] 上游截断：curl rc=23` —— 这是 AVPlayer 主动断连（走 relay
+  那一路的上游被 RST），属于正常行为，不是故障
+
+## 4. 仍未做（dvplay 客户端侧，不在 dvpack 范围内）
+- 按 share 的索引状态机 / DirectoryWatcher 增量刷新
+- 三级缩略图缓存 Key/Link/Path 分离（dvplay 已有 NSCache + 降采样，笔记已标注不再重复）
+
+# HANDOFF v31 (2026-11-15 13:45) — Infuse #5 落地（自适应窗口）；8899 被占导致 serve 整天没起来
+
+## 一句话结论
+**Infuse 笔记里「仍未做」的 #5（速率统计 → 自适应窗口）已落地并真机自测通过。**
+顺手救回一个更严重的问题：**端口 8899 从今天 01:17 起被别的进程占着，dvpack serve
+一直在 crash-loop，等于整天没服务。**
+
+## 1. 端口事故（先看这条）
+- 现场：`lsof -iTCP:8899 -sTCP:LISTEN` → PID 87955，命令是
+  `python3 -m http.server 8899 --bind 0.0.0.0`，cwd 在
+  `~/Library/Application Support/com.tencent.mac.marvis/.../workspace/conv_.../output`
+  —— 一个腾讯 Marvis 会话留下的静态文件服务，**与 dvpack 无关**。
+- 后果：`launchctl print gui/501/com.dvpack.serve` 显示 `state = spawn scheduled`、
+  `active count = 0`；`/tmp/dvpack-serve.log` 里
+  `OSError: [Errno 48] Address already in use` 累计 **5588 次**。
+- 处理：`kill 87955` → launchd KeepAlive 立刻拉起真 serve（新 PID 10783）。
+  `curl -s http://127.0.0.1:8899/__speed` 返回 200 即活。
+- **教训**：电视「无法播放/卡住」时先跑
+  `lsof -nP -iTCP:8899 -sTCP:LISTEN`，确认监听者是不是 dvpack。8899 是硬约定，
+  任何别的进程占着都会让服务静默死掉（launchd 只会无限重试）。
+
+## 2. #5 落地：`dvpack/speed.py` + `serve._respond`
+- **口径**：客户端 `bytes=A-` 之后又来 `bytes=(A+N)-`，间隔 Δt → 速率 N/Δt。
+  这是「这一段被真实消费掉的周期」，不是 socket write 耗时。
+- **踩坑实证**：4 Mbps 模拟链路上，2 MiB 响应的 write 只阻塞 1.15s（内核发送缓冲
+  吃掉了大半），若用写入耗时算会得到 13.6 Mbps，高 3 倍。所以写入耗时不参与估计。
+- **窗口**：`clamp(实测速率 × 1.5s, 256KiB, MAX_OPEN_RANGE_SEND)`；无样本时用静态上限。
+- **自测（127.0.0.1，限速 64KiB/0.12s）**：
+  - 请求 1：尚无样本 → 2048 KiB；
+  - 请求 2：判定 4.3 Mbps → **779 KiB**；
+  - `/__speed` → `{"mbps": 4.26, "samples": 1, "client": "127.0.0.1"}`。
+- **新增端点** `/__speed`：JSON，含 adaptive / target_seconds / max_bytes / 每客户端 mbps。
+  电视在放的时候直接 `curl http://192.168.1.115:8899/__speed` 就能看到那条链路实测带宽。
+- **开关**：`DVPACK_ADAPTIVE_RANGE=0` 关闭；`DVPACK_RANGE_TARGET_SECONDS` 改目标时长；
+  `DVPACK_MAX_OPEN_RANGE_SEND=0` 恢复到「照单全收」。
+- **日志**：`sent <name> <实发>/<应有>B ... (X Mbps, 有效 Y%)`——
+  现在能直接看出每次响应有多少是空转被丢掉的（`有效 %`）。
+
+## 3. 验证
+- `.venv/bin/python -m pytest tests/ -q` → **837 passed / 21 skipped / 0 failed**
+  （新增 `tests/test_speed.py` 14 条 + `test_serve.py::test_speed_endpoint_reports_adaptive_state`）。
+- serve 已用新代码重启（`launchctl kickstart -k gui/$(id -u)/com.dvpack.serve`）。
+- **DV 徽标不受影响**：改动只在开区间响应的字节数，master/CODECS/VIDEO-RANGE
+  信令链路一行未动。
+
+## 4. 仍未做
+- #6 RPU 动态元数据建模（`dvmeta.py` / `dovi_tool -m 5` 铺路）——等 single_fmp4 的
+  真机 DV 结论。
+- windows 侧 `scripts/deploy.ps1` 仍未经真机验证（等 .68 上跑）。
+
+# HANDOFF v30 (2026-11-08 22:00) — 「还是卡着」定案为 Mac 2.4GHz WiFi 带宽；字幕两项优化已落；迁移 .68 待到位
+
+## 一句话结论
+**卡顿不是 dvpack 代码问题，是 Mac 笔记本 2.4GHz WiFi 吞吐不够。**
+serve 进程健康、ATV 能连、包能解——瓶颈在 Mac 那一跳无线的 5 Mbps。
+
+## 决定性证据（2026-11-08 21:0x 现场）
+1. `system_profiler SPAirPortDataType`：Mac 挂在 **Channel 1 (2GHz, 20MHz)**，
+   Signal/Noise `-48 dBm / -87 dBm`（SNR 39 dB，信号本身不弱）——是容量不是信号。
+2. `/tmp/dvpack-serve.log` 实测分片速率：
+   - `sent video44.m4s 13192404B in 21.02s (5.0 Mbps)`
+   - `sent video45.m4s 20497662B in 0.50s (328.9 Mbps)` ← 同段落已缓存/本地命中，反差极大
+   4K DV 需持续 20~50 Mbps，5 Mbps 必然缓冲饥饿 → 20 秒左右卡死。
+3. `Request timed out` 累计 **59 次**，几乎全部来自 `192.168.1.100`（ATV 拉 Mac 的流）。
+4. `.68` 的 Jellyfin `8096` 回 302（活着）；ATV `192.168.1.100` ping 通。
+   ⇒ 局域网与 .68 都正常，问题只在 Mac 的无线出口。
+
+## 网络拓扑现状（重要，交接必读）
+- **Mac 当前 IP 是 `192.168.1.115`**（又漂了，历史值 .109 / .106 / .115）。
+  dvplay 的 `dvplay.lastURL.v3` 写死 `http://192.168.1.109:8899/master.m3u8` 已失效，
+  真正能用的是 `pack.host = @auto`（它会扫 192.168.1.x:8899 自己发现）。
+- Mac 三个以太网口 `en4/en5/en6` 全部 `Current: none`（**没插网线**）。
+  插网线是当前最快的解法，不用改一行代码。
+- `.68` 是有线网，把 dvpack 部署过去能彻底绕开 Mac 这一跳；
+  但 ATV 自己若仍在 2.4GHz，最后一段仍是瓶颈（会好转，不一定完全消失）。
+
+## 本轮落地（已提交、已推送、测试全绿）
+分支 `fix/lan-address`，HEAD `e254079`。
+
+- `d8efbc6` 并入 11-07/11-08 全部未提交改动（serve 并段续播、bmff/jfpack/remux、
+  DV 信令、字幕头段），作为迁移基线。
+- `e254079` 字幕两项优化：
+  - `dvpack/subs.py` 新增 `_dedupe_en_cues`：`en` 轨合并重叠/重复 cue，
+    解决「英文字幕重复两行、飘在屏幕中部」的现场问题。
+  - `dvpack/serve.py` 新增 `_has_chinese`：`_online_subs_body` 在片名含 CJK 时
+    直接返回「中文视频，跳过字幕」，不烧公网、不落负缓存。
+  - `tests/test_serve.py` 那条用「真片名」的用例改成英文名，保留它原本要验的
+    「直传片名不查 /Items」意图。
+
+### 验证数据
+- `.venv/bin/python -m pytest tests/ -q` → **824 passed / 19 skipped / 0 failed**（24.4s）。
+- `py_compile dvpack/subs.py dvpack/serve.py` 通过。
+- 已 `git push origin fix/lan-address`（`d8efbc6..e254079`）。
+
+## 未闭环（明示，勿当已过）
+- **真机复验未做**：本轮只跑离线测试。DV 徽标亮不亮、是否过 20 秒仍在推进，
+  都要等 Mac 换有线/5GHz 或部署到 .68 之后才能判。
+- **`deploy.ps1` 从未在真 Windows 跑过**（编写机无 PowerShell）。首次真机报错
+  按行号修。
+- **`tools/` 是 gitignored**：Windows 二进制（`ffmpeg.exe` 161MB、`ffprobe.exe`
+  161MB、`dovi_tool.exe` 3.2MB）和 `subfetch.py`、Bento4 一套都不在 git 里。
+  `.68` 上 `git clone` 出来 `tools/` 会缺东西——必须从 Mac 整目录拷过去。
+  这是迁移最容易踩的坑。
+- **字幕去重只对 `en` 生效**，中文轨保持原样（用户口径：中文不需要字幕，
+  但已有中文轨不主动删）。OpenSubtitles 的 key 由用户提供
+  （`4kQhoCbBVA1b2Aizgi1GpDQKb9V7qR9U`），部署时写进
+  `~/.dvpack/config.json` 或 `python -m dvpack config --os-key <key>`。
+- **磁盘**：`_out/dv_p7_fix/_jf` 占 48G，根盘剩 152G。迁到 .68 后 Mac 这份可以清。
+
+## 下一步（按优先级）
+1. **插网线**（`en4/en5/en6` 任一口）→ ATV 重放同一部片，看是否过 20 秒。
+   这是零改动验证「WiFi 是瓶颈」的最快路径。
+2. 或 **Mac 与 ATV 同时切 5GHz**，再测一次。
+3. 或 **把 dvpack 部署到 .68**（根治）：
+   ```powershell
+   git clone -b fix/lan-address https://github.com/cpufreestyle/dvpack.git C:\dvpack
+   cd C:\dvpack
+   .\scripts\deploy.ps1 -JfBase http://192.168.1.68:8096 -JfUser root -JfPassword 135790 -Port 8899
+   ```
+   记住先把 Mac 的 `tools/` 整目录拷进 `C:\dvpack\tools\`。
+4. 部署后在 ATV 的 dvplay 里把 `pack.host` 设为 `192.168.1.68:8899`。
+5. 验收三盯点：DV 徽标亮 / 时间码过 00:20 且持续推进 / `.68` 的
+   `logs/serve.log` 持续 `sent video*.m4s` 且无 `Request timed out`。
+
+## 排障速查（本次沉淀）
+- 判断 serve 活没活：`curl -o /dev/null -w '%{http_code}' http://<ip>:8899/`
+  → **404 就是活的**（dvpack 只认具体路径）。
+- 判断是不是带宽问题：grep `sent video` 看单分片耗时，换算 Mbps。
+  低于 20 Mbps 就是吞吐不足，别再改代码。
+- `ConnectionResetError: [Errno 54]` / `BrokenPipeError` 在 serve 日志里
+  通常只是 AVPlayer 主动断连，不是故障。
+- `Request timed out` 出现即说明客户端等不到数据，优先查链路不查逻辑。
+
 # HANDOFF v28 (2026-10-03 16:20) -- 流媒体无法播放根因：master 的 CODECS 写了 dvh1（-11848 / -15517）；改 hvc1 + SUPPLEMENTAL-CODECS
 
 ## 决定性证据链
@@ -2979,6 +3390,258 @@ prewarm 预热（--user root --pw）→ 日常运维（日志/重启/改端口/�
 
 ### 同步提交（补记）
 - 0443e43 feat(dvpack): Windows 部署移植（14 文件 +1009/-26）
-- 0604968 merge: 合入远端 9251047——serve.py 保 LF，只摘 IP_ADAPTER_INFO
+- 0604968 merge: 合入远端 9251047——serve.py 保 LF、只摘 IP_ADAPTER_INFO
   两段式修复，拒 CRLF 全文件翻弄（该修复正好治 Windows lan_address 必崩）
 - origin/master 已推进至 0604968，本地 fix/lan-address 与远端零差异。
+
+## 23:12 段：安全门禁清零 + LAN Linux 修复 + dvconfig 收拢 + PR #2（跨 11-03/11-05 会话）
+
+### 主线（审核 → 修复 → 重构）
+- bugbot 只读审核（code-reviewer 代理 + 人工复核）：1 个 Important——
+  `_posix_iface_addresses()` 的 sockaddr_in 用 macOS/BSD 布局，Linux 小端
+  family 字节恒读 0 → getifaddrs 枚举恒空 → lan_address() 静默退回 TUN
+  198.18.x（分支 headline fix 在 Linux 上失效）。修复 5bd2e1d：按平台挑
+  视图（Linux family 2 字节 sa_family_t @偏移 0；macOS/BSD 保 sa_len 前
+  缀），结构体模拟 family=2/10.0.2.2 + macOS 真机 lan_address=192.168.1.191。
+- Mimosa git 门禁拦截（33 高危）：密封深扫 32 项 + 1 依赖 advisory，分诊
+  为「26 项未跟踪本地脚本（tools/、_scratch/ 已 gitignore 但扫描器不尊重
+  gitignore）+ 6 项仓库代码」。全部原地修复，不绕钩子不豁免（写入门禁只
+  认候选块内完整校验：getaddrinfo+ipaddress 或 urlsplit 消毒值流入 sink；
+  跨文件入口告警也计门禁高危）。高危 30→0，提交 d4be73c。
+- 卫生项 a867522：bmff dvcC 位域注释纠偏（payload[2] 低位是 level 最高位，
+  非 rpu_present_flag）；subs 零时长首 cue 不再连 WEBVTT 头一起丢（头段
+  合并跨度到首条时长>0 的 cue，中间坏 cue 文本仍被带出）。
+- Infuse 静态学习笔记入库 3383a00（+201 行，用户自己的架构研究）。
+- dvconfig 收拢 8120704：Infuse 笔记第 3 条落地——p5.DvcConfig 本身就是
+  统一抽象，缺的是 bmff.clamp_dvcC_level 裸读字节。新建 dvpack/dvconfig.py
+  位域唯一实现（尊重 dvprofile「位域不搬进来」边界，放平级模块），p5 再
+  导出保持测试兼容，clamp 读数统一走 parse（6 位全量真值），写侧仍只动
+  payload[3] 单字节；测试夹具从病态 4 字节补足规范 24 字节形。
+- PR #2 已建：fix/lan-address → master（5 提交）
+  https://github.com/cpufreestyle/dvpack/pull/2
+
+### 关闭项（查实，非新代码）
+- 「prewarm 首段+热点窗口」关闭：serve INSTANT_PACK_SECONDS 起播 stub +
+  后台补全片早已覆盖该设计（prewarm 只批量预打全片），再做会重复现有机制。
+
+### 未闭环（明示，勿当已过）
+- Linux 真机验证 lan_address() 未跑成：DGX Spark SSH banner 超时（11-04/
+  11-05 两天复测均超时）、colima 镜像下载被网络卡死（磁盘零增长 8 分钟，
+  GitHub 托管镜像拉不动）。留给用户一条命令：
+  `python3 -c "from dvpack.serve import _posix_iface_addresses; a=_posix_iface_addresses(); print(a); assert a"`
+  非空即证明修复生效（旧代码 Linux 恒返回 []）。
+- P1 不变：.68 Windows 真机首跑三盯点（起播/字幕抓取/robust_rmtree），
+  deploy.ps1 报错按行号修。
+
+### 验证数据
+- mimosa audit --deep 高危 30→0（跨文件入口告警同清零）；全量 784 passed
+  / 21 skipped（环境性跳过），每步零回归。
+
+### 教训（本轮真实踩坑）
+- 一次 Write 长输出损坏（公式错/字段重复）被自查发现，按 p5 原文逐行核对
+  重写——长内容落盘后必须编译 + 测试兜底。
+- commit heredoc 在本环境会被搞坏（_lc 解析错误 → 空消息），改用 -F 消息文件。
+- colima「10 分钟零输出」是 `| tail` 管道缓冲假象，错杀过一次健康启动；
+  判定后台任务卡死要看磁盘/日志实据，不看输出静默。
+
+### 同步提交（本段）
+- 5bd2e1d fix(dvpack): sockaddr_in 按平台挑视图，修复 Linux LAN 枚举
+- d4be73c fix(dvpack): Mimosa L3 全量高危清零——SSRF/路径写/XXE 加固
+- 3383a00 docs(infuse): Infuse 静态学习笔记
+- a867522 fix(dvpack): dvcC 位域注释纠偏 + 字幕头段不随 0 时长首 cue 丢失
+- 8120704 feat(dvpack): DV 信令位域收拢到 dvconfig——唯一实现
+- （本 HANDOFF 提交推送后，PR #2 自动纳入）
+
+## 11-07 段：「片子只能放 20 秒」服务端半边成因——stub 开环 + 全片并段续播
+
+### 症状与两半成因
+真机点片起播正常，放到约 20 秒就停/转圈，服务端日志一片安静。拆成两半：
+1. **列表口径**：秒开 stub 由 `pack_source(seconds=INSTANT_PACK_SECONDS)` 打出，
+   落的是 `#EXT-X-PLAYLIST-TYPE:VOD` + `#EXT-X-ENDLIST`。RFC 8216 里 VOD 的语义
+   就是「播放列表不会改变」，播放器有权据此停止轮询——播完那 4 段就收场。
+2. **没有内容可放**：全片后台打包要 4~13 分钟。只开环（剥 ENDLIST）解决的是
+   「AVPlayer 肯继续轮询」，解决不了「这几分钟里放什么」。
+
+两半一起治，缺一半都还是「只能放 20 秒」。
+
+### 落地（dvpack/serve.py）
+- `_align_stub_to_full_pack(out_dir)`：**砍截断尾段 + 开环 EVENT**。
+  - 砍尾段（`_trim_stub_tail`）：stub 被 `-t 20` 截断，末段必然不完整
+    （实测 20s 源 → 6/6/6/2.083 四段），全片包同索引是完整的一段。两边同一
+    索引段时长不同，并段时播放器会在接缝处跳走几秒。砍掉截断尾段，stub 就是
+    全片包的严格前缀，**接缝长度为零**。
+  - 开环（`_open_stub_playlist` → `_write_growing_playlist`）：VOD+ENDLIST 翻成
+    EVENT（无 ENDLIST），AVPlayer 才会按 TARGETDURATION 持续轮询同一 URL。
+  - **幂等判据用列表形态，不用计数器**：ffmpeg 的 stub 永远 VOD+ENDLIST，
+    `_write_growing_playlist` 的产出永远 EVENT 且无 ENDLIST——「没开环」等价于
+    「没对齐过」。align 在 marker 落盘前跑（秒开路径），不能靠 marker 记状态。
+    漏了这条会二次砍尾段（单测 `test_align_is_idempotent` 抓到）。
+  - 与 `remux.trim_stub_tail` 不是一回事：那个按 `min_seconds` 丢「几帧的残尾」
+    （治黑屏），这个无条件丢末段（治并段接缝），且只管 serve 的秒开 stub。
+- `_grow_playback(tmp, out_dir, stop, item_id)`：全片打包期间把已封段逐个
+  `_copy_atomic`（先写 `.growing` 再 `os.replace`，AVPlayer 握着的旧 inode 不
+  被打断）进在播目录，并把 EVENT 列表一起改长。
+  - 安全闸：两份 `init.mp4` 逐字节相同才并段；不同就整体退化成「等换装」，
+    绝不把解不动的分片喂给电视。
+  - **发布量单调不减**：起点是在播列表已有的段数（`_published_count`），不是 0。
+    全片包刚开写时 tmp 里可能只有 2 段，以 0 起算会把 3 段的在播列表覆盖成
+    2 段——播放器正握着第 3 段，列表一短它就断。
+- 三个接线点：秒开打包后、`_pack_full_swap` 起 grower 前、`/jf/pack` 无锁快路
+  （重开同一部片 / 上一会话留下的 stub，`_open_stub_if_needed` 兜底）。
+  快路那条最关键：服务端重启后磁盘 stub 还是 VOD+ENDLIST，不开环照样复现，
+  而这条路根本不打包、日志一片安静。
+
+### 关键实测发现（会反复踩，先读）
+**ffmpeg 的 `-hls_playlist_type vod` + `-hls_list_size 0` 在编码期间不写
+video.m3u8，要等进程退出。** 实测：3s 时 6 个分片、7s 时 14 个分片，
+`video.m3u8` 始终不存在。所以 `_sealed_prefix` 读 tmp 列表这套设计在 VOD 口径下
+全程空转——必须让全片包走 EVENT 口径（实测 EVENT 边编码边写，19 个分片时列表
+已在盘上）。
+
+因此新增 `playlist_type` 参数贯通 `hls_command` → `pack_source`：
+- 秒开 stub 仍走 `vod`（默认，定长包 + ENDLIST，电视不会守着等追加）；
+- 全片后台打包走 `event`（`_pack_full_swap` 里显式传）；
+- 换装前由 `_seal_full_playlist(tmp)` 收回 VOD + ENDLIST——EVENT 无 ENDLIST 是
+  「还会有更多分片」的声明，不能当终态交给电视。
+- 并段只对单进程 `pack_source` 成立：parpack 的分块列表是 VOD 口径，grower 读
+  不到已封段。并行本来就默认关着（audio tfdt 接缝偏移未修），已在代码里写明代价。
+
+### 真 ffmpeg 端到端验证（/tmp/dvpk/e2e3，240s 合成源慢编码 34.6s）
+```
+stub        4 段 [6.0, 6.0, 6.0, 2.08] → 对齐后 3 段，EVENT，无 ENDLIST
+全片(EVENT) 边编码边写列表，grower 逐段并进：
+            在播列表采样 3,3,3,5,9,11,13,16,18,20,23,25,28,32,35,38,43,46,49
+            17 个增长台阶，单调不减（修发布下限前抓到过 3→2→4）
+分片比对    49/49 与全片包逐字节相同 → 接缝长度为零
+收口        50 段，VOD + ENDLIST
+```
+另外单独验过：`-t 32` 的 stub 与 90s 全片包，前 4 个分片 + init.mp4 逐字节
+相同（同一条 `hls_command`、同一套 setts 归一，分段边界由关键帧决定，确定性成立）。
+
+### 验证数据
+- `pytest tests/ -q`：**811 passed / 19 skipped / 0 failed**（环境性跳过）。
+  上一轮遗留的 `IndentationError`（`_open_end_of_playlist` 空函数体，6 个测试
+  文件 collection 全挂）已修掉；`test_align_is_idempotent`、
+  `test_never_shrinks_the_live_playlist`、`test_publishes_only_forward` 都是
+  本轮新增的回归网。
+
+### 未闭环（明示，勿当已过）
+- **真机未验**：以上全是本机 ffmpeg + 单测。要用户在两台机器上确认：
+  ① Apple TV 点一部全片，看是否放过 20 秒还在继续走（时间码 > 00:20）；
+  ② serve 日志出现 `并段 <id> → N 段` 且 N 逐步变大；
+  ③ 放到尾部能正常收场（VOD + ENDLIST，不再转圈）。
+- tvOS 客户端侧：`dvplay PlayerModel` 原本打算「stub 结束时探测 playlist 是否
+  变长、全片换装完成后 seek 续播」。服务端并段后这条大概率不再需要，但客户端
+  代码未改未验——若真机仍有跳帧/中断，优先看客户端是不是还在自己 seek。
+- `DVPACK_PARALLEL=1` 时并段不生效（parpack VOD 口径），已注释说明。
+
+## 11-08 段：并段修复上真机前的运行态整顿（serve 换代码 + 屏保结论）
+
+### 关键发现：真机链路一直在跑旧代码
+- 重启前 serve 进程起于 11-07 22:08，而 `dvpack/serve.py` 的并段修复落于
+  22:58——**「只能放 20 秒」的修复从未在真机链路上生效过**，之前的真机复测
+  全是旧代码行为。教训：改完 serve 必须确认运行进程的启动时间晚于文件 mtime。
+
+### 已执行的整顿
+- 重启 serve：`launchd` 任务 `com.dvpack.serve`（KeepAlive + RunAtLoad，
+  plist 在 `~/Library/LaunchAgents/`）自动拉起新进程 **PID 2879**
+  （python3.11，cwd=仓库，stdout/stderr → /tmp/dvpack-serve.log），
+  00:32:19 启动，晚于修复落盘时间，并段代码确认在跑。
+- 手工 nohup 抢端口失败（`Address already in use`，.venv 是 py3.14、
+  launchd 用 py3.11，两者都从仓库 cwd 加载同一份代码）——已退出，
+  8899 唯一属主是 2879。以后重启用 `launchctl kickstart -k
+  gui/$(id -u)/com.dvpack.serve`，别手起进程。
+- 端点烟测：`/jf/purge?id=__smoke__` → 200 JSON；`/jf/pack`（无 src）
+  → 400（设计行为）；根路径 404 正常（按需打包，无静态 master）。
+- Jellyfin 192.168.1.68:8096 200；ATV 192.168.1.100 ping 通。
+- `pytest tests/ -q`：**811 passed / 19 skipped / 0 failed**（py3.14 .venv）。
+
+### 屏保对真机验收的影响（结论）
+- 服务端完全不受影响：打包/并段都在 Mac 上跑，与电视屏保无关；serve 还是
+  launchd 托管，崩了自动拉起。
+- tvOS **播放中不会亮屏保**（播放自动抑制）。历史上那次「那是屏保」恰好
+  反证当时播放已经停了——屏保是结果不是原因。
+- 对取证的影响仅两点：① 屏保亮起时截图全是屏保画面，会误判 App 状态；
+  ② 屏保会挂起 App，播放不会自愈，必须有人按遥控器。验收循环应先唤醒再
+  截图；最稳是验收期把电视屏保设为 Never。
+- 本机无 atvremote 配对凭据（默认存储为空），驱动真机需用户在场。
+
+### 待办（下一步就是它）
+- 真机验收：ATV 点一部全片放 2-3 分钟，看 ① 时间码 > 00:20 还在走；
+  ② serve 日志 `并段 <id> → N 段` 且 N 逐步变大；③ 尾部 VOD + ENDLIST
+  正常收场。通过后再提交本轮未提交改动（serve/jfpack/remux + tests +
+  本 HANDOFF 段）。
+
+---
+
+## 2026-11-08 20:00 会话：The Beast In Me S01E02 播放（de741a）
+
+### 结论先行
+E02 的包**已经完整且可播**，DV 信令全对；此前「打不开 / 只能放 20 秒」
+的真因是 **serve 进程跑在旧代码上**，不是包坏了。
+
+### 定位过程
+- Jellyfin 检索确认 E02 = `de741a5c45ec02915c21b63ad7d50acf`
+  （The.Beast.in.Me.S01E02.Just.Dont.Want.to.Be.Lonely）。
+  登录走 `POST /Users/AuthenticateByName` + `Authorization: MediaBrowser ...` 头，
+  账号 `root` / `135790`（dvplay 默认用户名是 `root`，不是 AuthenticateByName）；
+  拿到 AccessToken 后**不能**当 `api_key` 用，要放进
+  `Authorization: MediaBrowser Token="..."` 头，否则 401。
+- 盘上状态：`de741a.../` 459 段 / 2806.4s / 46.77min / VOD+ENDLIST / 7.17G，
+  平均 20.45 Mbps。`._upgrade_de741a..._2879/` 已随换装清掉。
+
+### 根因：进程比代码旧（第二次踩同一个坑）
+- serve 进程起于 11-08 00:32:19，而 `serve.py`/`bmff.py` 的并段修复
+  落于 19:23。`__pycache__/serve.cpython-311.pyc`（00:32）里
+  `init_stream_compatible` 出现 **0 次**——即当时还是逐字节比对。
+- 日志实证：`[serve] init 不一致，放弃并段 de741a...`。而当前代码打的是
+  `init 不兼容（原因），放弃并段`，且 `init_stream_compatible` 对新旧
+  pyc 都是 2 次——**运行进程加载的确实是 19:23 之前的版本**。
+- 逐字节判错的实锤（真机采样）：同片源 20s stub 与全片包 init 只差三处
+  不影响解码的东西——movenc 追加的第二个 dvh1 entry、hvcC 数组
+  completeness 标志（0xa0→0x20）、多出来的前缀 SEI(39) 数组；
+  VPS/SPS/PPS、dvcC、colr、pasp、音轨逐字节全同，前两个分片也逐字节相同。
+  按字节判 → 整体放弃并段 → 电视停在 20 秒处转圈。
+- **教训（与上一轮同款，再次写明）**：改完 serve 必须确认运行进程的
+  启动时间晚于文件 mtime，否则真机复测全是旧代码行为。
+
+### 已执行的整顿
+- `launchctl kickstart -k gui/$(id -u)/com.dvpack.serve` 重启 serve，
+  新进程 **PID 77472**（19:55:50 起）。核对新 pyc：
+  `serve.cpython-311.pyc` 与 `bmff.cpython-311.pyc` 里
+  `init_stream_compatible` 分别 2 / 4 次，确认加载的是修复后代码。
+- 重启前先确认无在飞打包（旧 ffmpeg 73519 已自然结束），
+  旧 serve 名下的两个孤儿 ffmpeg 随父进程退出，其
+  `._upgrade_*_2879/` 残根由 `_sweep_stale_swaps` 按 pid 活性回收。
+- 杀掉模拟器里白烧 CPU 的 dvplay（PID 95085，CoreSimulator
+  974776B7… 内，已跑 **19.6 小时**、稳定 97% CPU 软解 4K DV）。
+  Mac load average 25.96 → 12.23，Shadowrocket 的 MacPacketTunnel
+  从 55% 降到 8%。**真机验收期间不要留着模拟器放片。**
+
+### 包质量验证（全部通过）
+- `scripts/dvassert.sh`：**PASS=9 FAIL=0**
+  （master VIDEO-RANGE=PQ、CODECS=dvh1.05.*、hvcC Tier=0、
+  dvcC profile5/rpu1/bl1/el0/compat0、段内 inband RPU 55102 字节）。
+- ffprobe：3840x2160 / yuv420p10le / bt2020nc+smpte2084+bt2020 /
+  dvh1 / eac3 5.1 48kHz。
+- 结构：459 段 tfdt 全单调（0 处倒退），音频 trun 采样时长无 0 值，
+  音频 tfdt 增量与 EXTINF 逐段吻合（48kHz 时基），前 60 段接缝全连续。
+- 解码：video7–11（卡点区间）真实解码 `-xerror` **exit=0 零错误**。
+- HTTP：逐段 200（20–30MB / 0.02s），末尾段 400/450/458 全通，
+  双语字幕 vtt + m3u8 全 200，无 `.growing/.open/.sealed` 残留。
+
+### 仍存在的环境瓶颈（不是包的锅）
+- Mac Wi-Fi 挂在 **2.4GHz 信道1 / 20MHz / 146Mbps**，实测 ATV 拉
+  25–30MB 段要 18–71s（≈13Mbps 有效），低于 E02 的 20.45Mbps 均值
+  → 缓冲饥饿。**换 5GHz 是这类 4K DV 片的前提。**
+- ATV 侧日志：20:00:26 起播后 video0→8 连续推进、服务端零错误，
+  20:04:12 一次 `Request timed out` 后停止（疑似用户手动停止或
+  AVPlayer 放弃）。serve 进程本身 0% CPU、端口正常 LISTEN。
+- `_out/dv_p7_fix/_jf` 已占 **48G**，磁盘剩 154G——注意容量。
+
+### 待办
+- 真机复验：ATV 重放 E02，确认 ① 时间码越过 00:20 且持续推进到片尾；
+  ② 电视亮 Dolby Vision 徽标（dvassert 9/9 已保证信令面）；
+  ③ serve 日志无 `Request timed out`。
+- 若仍卡：先把 Mac 与 ATV 都切到 5GHz 再测，排除吞吐因素。
+- 之后提交本轮未提交改动（serve/jfpack/remux/bmff + tests + 本段）。

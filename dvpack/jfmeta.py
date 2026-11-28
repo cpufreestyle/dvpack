@@ -58,11 +58,25 @@ def auth_header(token: str | None = None) -> str:
     return ", ".join(parts)
 
 
+def checked_url(base_url: str, path_query: str = "") -> str:
+    """拼 URL 前校验 scheme，只放行 http(s)。
+
+    base_url 来自配置或请求侧输入，若被写成 file:// 之类，urlopen 会直接
+    读本地文件或走陌生协议——请求发出前拦下，错误信息直说原因。
+    """
+    url = base_url.rstrip("/") + path_query
+    parts = urlsplit(url)
+    if parts.scheme not in ("http", "https") or not parts.hostname:
+        raise JfMetaError("Jellyfin 地址必须是 http(s)：%s" % url)
+    return url
+
+
 def login(base_url: str, username: str, password: str, timeout: float = 15.0) -> str:
     """账号密码登录换 AccessToken。失败抛 JfMetaError（不吞）。"""
     body = json.dumps({"Username": username, "Pw": password}).encode("utf-8")
+    url = checked_url(base_url, "/Users/AuthenticateByName")
     req = urllib.request.Request(
-        base_url.rstrip("/") + "/Users/AuthenticateByName",
+        url,
         data=body,
         headers={
             "Authorization": auth_header(),
@@ -101,8 +115,8 @@ def media_streams(base_url: str, token: str, item_ids: list[str],
     for start in range(0, len(item_ids), 20):
         chunk = item_ids[start:start + 20]
         query = "&".join("ids=%s" % iid for iid in chunk)
-        url = "%s/Items?Fields=MediaStreams,ProductionYear,Path&%s" % (
-            base_url.rstrip("/"), query)
+        url = checked_url(
+            base_url, "/Items?Fields=MediaStreams,ProductionYear,Path&%s" % query)
         req = urllib.request.Request(url, headers={
             "Authorization": auth_header(token),
             "Accept": "application/json",
@@ -126,8 +140,7 @@ def item_name(base_url: str, token: str, item_id: str,
     """
     if not item_id:
         raise JfMetaError("缺 item id")
-    url = "%s/Items?ids=%s&Fields=Path,ProductionYear" % (
-        base_url.rstrip("/"), item_id)
+    url = checked_url(base_url, "/Items?ids=%s&Fields=Path,ProductionYear" % item_id)
     req = urllib.request.Request(url, headers={
         "Authorization": auth_header(token),
         "Accept": "application/json",
@@ -237,9 +250,12 @@ def list_items(base_url: str, token: str,
     Path 必须带到：dvplay 的 packURL 容器后缀（stream.mkv/stream.mp4）
     就是从它推的，预热重建 src 少了它指纹就对不上现役缓存。
     """
+    url = checked_url(
+        base_url,
+        "/Items?Recursive=true&IncludeItemTypes=%s&Fields=Path,ProductionYear"
+        "&Limit=%d" % (include_types, limit))
     req = urllib.request.Request(
-        "%s/Items?Recursive=true&IncludeItemTypes=%s&Fields=Path,ProductionYear"
-        "&Limit=%d" % (base_url.rstrip("/"), include_types, limit),
+        url,
         headers={"Authorization": auth_header(token), "Accept": "application/json"})
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
