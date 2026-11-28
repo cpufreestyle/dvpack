@@ -15,6 +15,8 @@ from dvpack.playlist import (
     bandwidth_from_segments,
     master_playlist,
     parse_stream_inf,
+    plain_variant_from_source,
+    plain_video_codec,
     playlist_segment_seconds,
     variant_from_master,
     variant_from_source,
@@ -112,6 +114,27 @@ def test_audio_codec_can_be_overridden_to_none_for_split_variants():
     src = _source(audio="aac")
     line = variant_from_source(src, "v.m3u8", bandwidth=1, audio_codec="").stream_inf()
     assert 'CODECS="hvc1.2.4.L153.B0"' in line
+
+
+# ── Non-DV 片源：按实际编码写 CODECS（2026-11-28 海康 NAS AVC MP4 回归）──
+# 事实：NAS 上 45MB 的 AVC MP4 走 /jf/pack 时报
+# `ValueError: init 段里找不到 hvcC box`（AVC 的配置盒是 avcC，不是 hvcC）。
+# 修法一：非 DV 源不拆 hvcC；修法二：CODECS 按实际 codec 写 avc1.*，
+# 写死 hvc1 会让 AVPlayer 按 HEVC 解 AVC 流。
+
+
+def test_plain_video_codec_follows_actual_codec():
+    assert plain_video_codec("h264") == "avc1.4D401F"
+    assert plain_video_codec("H264") == "avc1.4D401F"
+    assert plain_video_codec("hevc").startswith("hvc1.")
+
+
+def test_plain_variant_writes_avc_codecs_for_avc_source():
+    src = _source(stream_overrides={"codec_name": "h264", "color_transfer": "bt709"})
+    line = plain_variant_from_source(src, "v.m3u8", bandwidth=1).stream_inf()
+    assert 'CODECS="avc1.4D401F' in line
+    assert "hvc1" not in line
+    assert "VIDEO-RANGE=SDR" in line
 
 
 def test_profile81_gets_hdr10_compat_brand():

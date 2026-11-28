@@ -422,6 +422,24 @@ def test_jfpack_can_keep_colr_control_arm(tmp_path: Path):
     assert 39 in types, f"对照臂应保留 39 数组，现有 {types}"
     assert result.verification.ok, result.verification.problems
 
+
+#: NAS 上的真实 AVC 片源（MiniDLNA 媒体库）。
+#: 2026-11-28 实测：这条源打 /jf/pack 时报
+#: `ValueError: init 段里找不到 hvcC box`（AVC 的配置盒是 avcC），
+#: 端点回 502，电视侧表现是「点 NAS 影片播放失败」。
+NAS_AVC_SRC = os.environ.get("DVPACK_NAS_AVC_URL", "")
+needs_nas = pytest.mark.skipif(not NAS_AVC_SRC, reason="缺 DVPACK_NAS_AVC_URL")
+
+
+@needs_nas
+def test_jfpack_handles_avc_source_without_hvcC(tmp_path: Path):
+    """AVC 片源必须能打包成功：master 写 avc1.*，不能因缺 hvcC 炸穿。"""
+    result = pack_source(NAS_AVC_SRC, tmp_path / "avc", seconds=6, segment_seconds=6.0)
+    assert result.verification.ok, result.verification.problems
+    master = result.master.read_text(encoding="utf-8")
+    assert "avc1." in master, master
+    assert "hvc1" not in master, master
+
 JF_SRC = "http://192.168.1.68:8096/Videos/ab47/stream.mkv?static=true&api_key=KEY"
 
 

@@ -1334,8 +1334,17 @@ class HlsRequestHandler(SimpleHTTPRequestHandler):
             self.send_error(400, "bad audio")
             return
         maps = VIDEO_ONLY_MAPS if raw_audio == "0" else VIDEO_AUDIO_MAPS
+        # m5=1：RPU M5 重排诊断模式（dovi_tool -m 5 inject-rpu）。
+        # 专门用于真机 A/B 验证「single-fmp4 + M5 reshape 能不能点亮 DV 徽标」。
+        # 产物写到 _jf/<id>_m5/，与主缓存隔离，不影响正常播放。
+        raw_m5 = (query.get("m5") or ["0"])[0]
+        if raw_m5 not in ("0", "1"):
+            self.send_error(400, "bad m5")
+            return
+        rpu_m5 = raw_m5 == "1"
 
-        out_dir = Path(self.directory) / "_jf" / item_id
+        out_name = item_id + ("_m5" if rpu_m5 else "")
+        out_dir = Path(self.directory) / "_jf" / out_name
         # 无锁快路：产物已在盘上（秒开段或全片）秒回 302。这次读盘绝不能排在
         # _pack_lock_for 后面——后台全片 worker 持同一把非重入锁跑好几分钟，
         # 期间每个 /jf/pack 轮询都阻塞在锁上直到客户端超时，serve 日志连请求
@@ -1347,7 +1356,7 @@ class HlsRequestHandler(SimpleHTTPRequestHandler):
             # 「片子只能放 20 秒」，而这条路根本不打包、serve 日志一片安静。
             # 全片包（seconds==0）和毒包都不碰，见 _open_stub_if_needed。
             _open_stub_if_needed(out_dir)
-            self._send_pack_redirect(item_id)
+            self._send_pack_redirect(item_id, m5=rpu_m5)
             return
         # Declared outside the lock so the post-lock spawn can always see it
         # (cache-hit path never assigns it).
@@ -1409,6 +1418,7 @@ class HlsRequestHandler(SimpleHTTPRequestHandler):
                             maps=maps,
                             master_uri=f"/_jf/{item_id}/video.m3u8",
                             subtitle_texts=texts,
+                            rpu_m5=rpu_m5,
                         )
                         # 秒开包对齐 + 开环：电视播完秒开段后持续轮询同一
                         # URL，后台并进来的全片段让它接着放，不再「只能放
@@ -1437,7 +1447,10 @@ class HlsRequestHandler(SimpleHTTPRequestHandler):
                             maps=maps,
                             master_uri=f"/_jf/{item_id}/video.m3u8",
                             subtitle_texts=texts,
+                            rpu_m5=rpu_m5,
                         )
+                    if rpu_m5:
+                        _need_full_upgrade = False
                 except PACK_ERRORS:
                     # 端点必须回 502，不能把连接掐断（客户端只见 http 000）；
                     # 真实原因落进 serve 日志，排障不再现场全盲。
@@ -1472,9 +1485,9 @@ class HlsRequestHandler(SimpleHTTPRequestHandler):
             # 守护线程，绝不占这条 302 请求——AVPlayer 等超时即「点片没反应」。
             self._spawn_online_subs(src, item_id, out_dir)
 
-        self._send_pack_redirect(item_id)
+        self._send_pack_redirect(item_id, m5=rpu_m5)
 
-    def _send_pack_redirect(self, item_id: str) -> None:
+    def _send_pack_redirect(self, item_id: str, *, m5: bool = False) -> None:
         """302 到 master.m3u8：URLSession 与 AVPlayer 都会自动跟随。"""
         # 302 让绝对路径的 master 落地；URLSession（ManifestInspector）与
         # AVPlayer 都会自动跟随。必须指 master.m3u8 而不是
@@ -1482,7 +1495,8 @@ class HlsRequestHandler(SimpleHTTPRequestHandler):
         # 里（playlist.py 论证），直出 media playlist 会把这两个信号全
         # 丢掉，tvOS 不走 DV 解码通路。2026-09-27 起徽标不亮的根因。
         self.send_response(302)
-        self.send_header("Location", f"/_jf/{item_id}/master.m3u8")
+        suffix = "_m5" if m5 else ""
+        self.send_header("Location", f"/_jf/{item_id}{suffix}/master.m3u8")
         self.send_header("Content-Length", "0")
         self.end_headers()
 

@@ -41,6 +41,29 @@ def hevc_base_codec() -> str:
     """
     return _hevc_codec(_HEVC_LEVEL_CAP)
 
+#: AVC（ffprobe codec_name）→ RFC 6381 的 CODECS 串。
+#: 40/41 = Baseline/Main，4D = Main profile，42 = Extended，4E = High。
+#: 约束级别 40（3.1）起步——Apple TV 对高约束级别流支持有限。
+_AVC_CODECS = {
+    "h264": "avc1.4D401F",
+    "avc": "avc1.4D401F",
+    "avc1": "avc1.4D401F",
+}
+
+
+def plain_video_codec(codec_name: str) -> str:
+    """Non-DV 片源的 CODECS 视频段：按**实际**编码写，不写死 hvc1。
+
+    2026-11-28 实测：海康 NAS 上 45MB 的 AVC MP4 走 /jf/pack 时报
+    `ValueError: init 段里找不到 hvcC box`（AVC 的配置盒是 avcC）。
+    同一个包的 master 若照写 hvc1.*，AVPlayer 会按 HEVC 去解 AVC 流，
+    起播即失败。所以这里按 ffprobe 的 codec_name 分流。
+    """
+    key = (codec_name or "").strip().lower()
+    if key in _AVC_CODECS:
+        return _AVC_CODECS[key]
+    return hevc_base_codec()
+
 
 @dataclass(frozen=True)
 class Variant:
@@ -137,6 +160,35 @@ def variant_from_source(
         frame_rate=video.frame_rate or None,
         hdcp_level=hdcp_level,
         supplemental_codecs=supplemental_codecs(source, target=target),
+    )
+
+
+def plain_variant_from_source(
+    source: SourceInfo,
+    uri: str,
+    *,
+    bandwidth: int,
+    audio_codec: str | None = None,
+) -> Variant:
+    """Non-DV variant: no supplemental DV signalling.
+
+    CODECS 必须写**实际编码**：AVC 片源写 avc1.*，HEVC 写 hvc1.*。
+    写死 hvc1 会让 AVPlayer 按 HEVC 去解 AVC 流——首帧就失败（2026-11-28
+    海康 NAS 上 45MB 的 AVC MP4 实测 502/黑屏）。
+    """
+    video = source.video
+    codec = plain_video_codec(video.codec)
+    audio = source.audio_codec if audio_codec is None else audio_codec
+    if audio:
+        codec = f"{codec},{audio}"
+    return Variant(
+        uri=uri,
+        bandwidth=bandwidth,
+        codecs=codec,
+        video_range=video.apple_video_range,
+        resolution=(video.width, video.height) if video.width and video.height else None,
+        frame_rate=video.frame_rate or None,
+        hdcp_level="TYPE-1" if video.apple_video_range == "SDR" else None,
     )
 
 

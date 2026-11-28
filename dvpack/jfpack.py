@@ -15,6 +15,7 @@ from __future__ import annotations
 import os
 import subprocess
 import tempfile
+import traceback
 from dataclasses import dataclass, replace
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
@@ -25,6 +26,7 @@ from .bmff import (
     drop_hvcC_param_set_type,
     keep_single_sample_entry,
     locate_dv_boxes,
+    parse_file,
     remove_box,
     sample_entry_count,
     normalize_sidx,
@@ -41,6 +43,7 @@ from .p5 import resign_pack
 from .playlist import (
     bandwidth_from_segments,
     playlist_segment_seconds,
+    plain_variant_from_source,
     variant_from_source,
     write_master_playlist,
 )
@@ -65,6 +68,41 @@ from .remux import (
     verify,
 )
 from .remux import _run
+
+
+def verify_plain(source: SourceInfo, output: RemuxOutput) -> Verification:
+    """非 DV 源的产出自检：只查与 DV 无关的通用事实。
+
+    DV 判据（sample entry 必须是 dvh1、hvcC 必须带 VPS/SPS/PPS、dvcC 配置盒）
+    一律不适用：AVC 源的 sample entry 是 avc1、参数集在 avcC 里。套上去会
+    把能播的包判死（2026-11-28 海康 NAS AVC MP4 实测）。
+
+    这里查的三件事与编码无关，任何片源都该成立：
+      1. init 段有且只有一个 video sample entry（多 entry 的 init 会被 tvOS 拒收）；
+      2. 时间轴静态预检（tfdt 单调、duration > 0）；
+      3. 产物有 init、有分片。
+    """
+    problems: list[str] = []
+    report = parse_file(output.init)
+    video = report.video
+    signalling = video.signalling if video else "init 段里没有视频轨"
+    if video is None:
+        problems.append(signalling)
+    try:
+        entries = sample_entry_count(output.init.read_bytes())
+    except ValueError:
+        entries = 0
+    if entries != 1:
+        problems.append(f"init 的 video sample entry 数={entries}（应为 1）")
+    if not output.segments:
+        problems.append("产物没有分片")
+    return Verification(
+        ok=not problems,
+        signalling=signalling,
+        source_dovi=None,
+        output_dovi=None,
+        problems=tuple(problems),
+    )
 
 
 class JfPackError(Exception):
@@ -260,6 +298,10 @@ def pack_source(
     #: EVENT = 边编码边写列表。serve 的全片后台打包要 EVENT，好让并段线程
     #: 增量读到已封段（见 remux.hls_command 的 playlist_type）。
     playlist_type: str = "vod",
+    #: 诊断模式：在所有 DV 后处理结束后，用 dovi_tool -m 5 重写 init +
+    #: 每段的 RPU（Infuse 的 GENERATE_DOVI_RESHAPE 对应物）。用于真机 A/B
+    #: 验证「single-fmp4 + M5 reshape 能不能点亮 DV 徽标」。默认关。
+    rpu_m5: bool = False,
 ) -> PackResult:
     """URL → HLS。闸门不过就不动 ffmpeg；产出不完整就报错，不留半个包。
 
@@ -278,8 +320,7 @@ def pack_source(
     # 都不请求（2026-09-27 与 2026-10-03 狂飙 ab476f 两次真机复现）。
     maps, declared_audio, transcode_audio = audio_pack_mode(source, maps)
     verdict = mvp_verdict(source)
-    if not verdict.supported:
-        raise JfPackError(f"拒绝打包：{verdict.reason}")
+    dolby_vision = verdict.supported
 
     # 全色域口径从源推导，不写死 limited：2026-09-26 实测本片源容器
     # color_range=pc、RPU bl_video_full_range_flag=1、signalstats 逐帧
@@ -302,7 +343,7 @@ def pack_source(
             segment_seconds=segment_seconds,
             colorimetry=_source_colorimetry(source),
             full_range=full_range,
-            bsf=dv_signalling_bsf(source),
+            bsf=dv_signalling_bsf(source) if dolby_vision else None,
             maps=maps,
             setts=setts_bsf(source) if normalize_timestamps else None,
             transcode_audio=transcode_audio,
@@ -363,13 +404,14 @@ def pack_source(
     if dropped:
         atomic_write(output.init, init_bytes)
 
-    resign_pack(output.init, source.dovi)
+    if dolby_vision:
+        resign_pack(output.init, source.dovi)
 
     # 变体 A（默认开）：剥掉 hvcC 里的前缀 SEI(39) 参数集数组，与 Apple 官方
     # DV P5 参考流同构（其 hvcC 只有 32/33/34 三个）。2026-09-26 真机 v2 正在
     # 验证这一臂（v1 只去 colr，v2 再加剥 39）。drop_param_set_type=None 可回退
     # 到 movenc/extract_extradata 原样直出的对照臂。
-    if drop_param_set_type is not None:
+    if dolby_vision and drop_param_set_type is not None:
         init_bytes, dropped_arrays = drop_hvcC_param_set_type(
             output.init.read_bytes(), drop_param_set_type
         )
@@ -405,14 +447,58 @@ def pack_source(
         atomic_write(output.init, init_bytes)
         level_notes.append(f"compressor 名 {old_name!r} 已清空")
 
-    target = source.dovi.profile5_target
-    if target.level > dv_level:
-        # master 的 CODECS 走 target_apple_codec：只钳 init 的 dvcC 而 master
-        # 还写 dvh1.05.09，两边不一致，AVPlayer 认的是 master 里那个值。
-        # level 9 是 8K 档（Apple 官方 4K 参考流 dvh1.05.06），probe 也早把
-        # P5 的 level 7/9 列进 _RISKY_P5_LEVELS。
-        target = replace(target, level=dv_level)
-        level_notes.append(f"master CODECS level 已钳到 {dv_level}")
+    if rpu_m5 and source.dovi and source.dovi.profile == 5:
+        try:
+            from .dvmeta import reshape_rpu_roundtrip, DvMetaError
+            m5_dir = out_dir / "_m5"
+            m5_dir.mkdir(parents=True, exist_ok=True)
+            m5_init = m5_dir / output.init.name
+            m5_init.write_bytes(output.init.read_bytes())
+            m5_segments: list[Path] = []
+            for seg in output.segments:
+                target = m5_dir / seg.name
+                target.write_bytes(seg.read_bytes())
+                m5_segments.append(target)
+            reshaped_init, before_scan, after_scan = reshape_rpu_roundtrip(
+                m5_init, work_dir=m5_dir, keep_intermediates=False,
+            )
+            reshaped_segments: list[Path] = []
+            for seg in m5_segments:
+                seg_m5, _, _ = reshape_rpu_roundtrip(
+                    seg, work_dir=m5_dir, keep_intermediates=False,
+                )
+                reshaped_segments.append(seg_m5)
+            atomic_write(output.init, reshaped_init.read_bytes())
+            for original, reshaped in zip(output.segments, reshaped_segments):
+                atomic_write(original, reshaped.read_bytes())
+            notes = list(notes)
+            notes.append(
+                f"RPU M5 重排：{before_scan.rpu_count()}→{after_scan.rpu_count()} 帧，"
+                f"覆盖 {after_scan.coverage_pct():.1f}%"
+            )
+            from .dvprofile import codec_for_profile
+            target = codec_for_profile(source.dovi.profile5_target)
+            notes.append(f"master CODECS 保持 {target.apple_codec()}（M5 不改 profile）")
+            try:
+                robust_rmtree(m5_dir)
+            except OSError:
+                pass
+        except (DvMetaError, ImportError, OSError) as exc:
+            raise JfPackError(f"RPU M5 重排失败：{exc}") from exc
+        except Exception:
+            traceback.print_exc()
+            raise JfPackError("RPU M5 重排失败（未知错误）")
+
+    target = None
+    if dolby_vision:
+        target = source.dovi.profile5_target
+        if target.level > dv_level:
+            # master 的 CODECS 走 target_apple_codec：只钳 init 的 dvcC 而 master
+            # 还写 dvh1.05.09，两边不一致，AVPlayer 认的是 master 里那个值。
+            # level 9 是 8K 档（Apple 官方 4K 参考流 dvh1.05.06），probe 也早把
+            # P5 的 level 7/9 列进 _RISKY_P5_LEVELS。
+            target = replace(target, level=dv_level)
+            level_notes.append(f"master CODECS level 已钳到 {dv_level}")
     effective_seconds = seconds
     if effective_seconds == 0:
         effective_seconds = playlist_duration(output.playlist)
@@ -428,13 +514,21 @@ def pack_source(
     # ——master 宣称有音频而 init/media 里没有，AVPlayer 直接拒收整个
     # master，真机症状是黑屏、日志里只有一次 master.m3u8 加 video.m3u8、
     # init.mp4 一次都不请求（2026-09-27 实测复现）。
-    variant = variant_from_source(
-        source,
-        master_uri,
-        bandwidth=bandwidth,
-        target=target,
-        audio_codec=declared_audio,
-    )
+    if dolby_vision:
+        variant = variant_from_source(
+            source,
+            master_uri,
+            bandwidth=bandwidth,
+            target=target,
+            audio_codec=declared_audio,
+        )
+    else:
+        variant = plain_variant_from_source(
+            source,
+            master_uri,
+            bandwidth=bandwidth,
+            audio_codec=declared_audio,
+        )
     # 双语字幕轨与 master 同目录落盘（byte-range 切片，不铺碎文件）。
     # 必须走 write_master_playlist 的原子替换：打包中途磁盘打满时直接写会把
     # 电视正在播的 master 冲成 0 字节（ENOSPC → 「播放失败」，见 playlist.py）。
@@ -443,16 +537,26 @@ def pack_source(
         out_dir / "master.m3u8", [variant], subtitles=tracks
     )
 
-    verification = verify(source, output, target=target)
+    if dolby_vision:
+        verification = verify(source, output, target=target)
+    else:
+        # 非 DV 源（NAS 上的 AVC/HEVC SDR 片）不适用 DV 判据：verify() 里的
+        # 「sample entry 必须是 dvh1」「hvcC 必须带 VPS/SPS/PPS」两条都是 DV
+        # 专属，套在 AVC 源上会凭空报两条问题、把能播的包判死
+        # （2026-11-28 海康 NAS AVC MP4 实测：problems 里写「sample entry 是
+        # avc1，不是 dvh1」+「hvcC 缺参数集」）。
+        verification = verify_plain(source, output)
     notes = [f"带宽 {bandwidth} bps：{len(output.segments)} 个分片 / {effective_seconds:.3f}s"]
-    notes += list(verdict.warnings)
+    notes += list(verdict.warnings if dolby_vision else [])
+    if not dolby_vision:
+        notes.append(f"非 DV 源按普通 HEVC/HDR 转封装：{verdict.reason}")
     notes += level_notes
     # 信令规范化：VUI 颜色三件套已由 ffmpeg 侧 hevc_metadata 重写成 P5
     # 口径、range 位按源重写（dv_signalling_bsf + source_full_range），
     # 这里补 hevc_metadata 改不了的 2 位 PTL（tier=1、non_packed=1）并二次
     # 确认 range 位，对齐 expected_signalling(full_range)。签名不认就原样
     # 跳过：打包不因打签失败炸穿。
-    if signalling_signature_ok(output.init.read_bytes()) and (
+    if dolby_vision and signalling_signature_ok(output.init.read_bytes()) and (
         not output.segments
         or signalling_signature_ok(output.segments[0].read_bytes())
     ):

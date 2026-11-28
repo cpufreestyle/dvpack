@@ -9,14 +9,16 @@
 ## 0. 结论先行
 
 Infuse 是一个 **ffmpeg 全家桶 + 自研播放内核 + 多协议网络层** 的成熟播放器。
-对 dvpack 最有价值的三点，按收益排序：
+对 dvpack 最有价值的三条主线，截至 2026-11-21 已全部落地：
 
 1. **InputStream 分层装饰器链**（ReadAhead → Cache → RangeAccess → SpeedMeter）——
-   dvpack 的 serve/prewarm 目前是「整段缓存 + 全片重打」，可以学它的按需分层。
-2. **Demuxer 策略化 + 环形/分块双 PacketStorage**——dvpack 目前 remux 完即弃，
-   没有「边下边解」的概念；这对 HLS 直播/长片内存占用直接相关。
-3. **DV 信令按「配置记录」单独建模**（`DolbyVisionConfiguration` + `AVDOVIMetadata`）——
-   dvpack 的 bmff/p5 已经做得比较细，但缺一个统一的「信令来源」抽象。
+   落到 `relay.py`（Range 缓存）、`speed.py`（速率计量 + 自适应窗口）、`serve._respond`。
+2. **DV 信令按「配置记录」单独建模**（`DolbyVisionConfiguration` + `AVDOVIMetadata`）——
+   落到 `dvprofile.py`（静态 profile/level/brand/RANGE 映射）+ `dvmeta.py`（逐帧 RPU 建模 + dovi_tool M5 重排）。
+3. **Demuxer 预检**（`StreamCorrectionAndValidation` + PTS 修复）——落到 `remux.validate_segments()`
+   与 `bmff.init_stream_compatible()`，坏源在起包前就被拒掉。
+
+其余建议（#3/#4/#5/#6）和上面三条是同一条主干上的不同切面，详见第 3 节表格。
 
 ## 1. 二进制画像（Observed）
 
